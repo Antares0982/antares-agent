@@ -105,9 +105,11 @@ class Translator:
                         self._event(EventType.TEXT, {"content": block.text, "delta": False}, agent)
                     )
             elif isinstance(block, ThinkingBlock):
-                events.append(
-                    self._event(EventType.THINKING, {"content": block.thinking}, agent)
-                )
+                # Empty thinking blocks are common and carry nothing.
+                if block.thinking.strip():
+                    events.append(
+                        self._event(EventType.THINKING, {"content": block.thinking}, agent)
+                    )
             elif isinstance(block, ToolUseBlock):
                 events.extend(self._tool_use(block, agent))
         return events

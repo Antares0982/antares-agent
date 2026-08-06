@@ -26,7 +26,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from . import gitdiff, index
+from . import gitdiff
 from .approvals import ApprovalBroker
 from .config import Settings
 from .eventlog import EventLog
@@ -86,11 +86,6 @@ class ThreadRunner:
     # -- lifecycle -------------------------------------------------------
 
     async def start(self, resume: str | None = None) -> None:
-        # The index is regenerated per thread; existing threads keep the one
-        # they started with (01-workspace-manifest.md).
-        with contextlib.suppress(OSError, index.DuplicateSkillError):
-            index.write(self.manifest)
-
         self._client = self._new_client(options=self._options(resume))
         await self._client.connect()
         self._pump = asyncio.create_task(self._read_forever(), name=f"pump-{self.thread_id}")
