@@ -59,8 +59,16 @@ class Translator:
 
     @property
     def idle_possible(self) -> bool:
-        """A ResultMessage only ends the thread's work if nothing is left."""
-        return not self.background_tasks
+        """A ResultMessage only ends the thread's work if nothing is left.
+
+        Checking `background_tasks` alone is not enough. In the F25 trace the
+        *first* `background_tasks_changed` arrived only after the first
+        `ResultMessage`, so at the moment we have to make the call the task
+        list is still empty and would wrongly read as idle. An Agent tool call
+        with no result yet is known earlier and says the same thing, so both
+        are consulted.
+        """
+        return not self.background_tasks and not self._spawns
 
     def handle(self, message: Message) -> list[Event]:
         if isinstance(message, AssistantMessage):
@@ -76,6 +84,10 @@ class Translator:
             return self._task_updated(message)
         if isinstance(message, TaskNotificationMessage):
             self.background_tasks.discard(message.task_id)
+            # A subagent that died without producing a tool_result would
+            # otherwise pin the thread to `busy` forever.
+            if message.tool_use_id:
+                self._spawns.pop(message.tool_use_id, None)
             return [self._status(ThreadStatus.BUSY)]
         if isinstance(message, SystemMessage):
             return self._system(message)
