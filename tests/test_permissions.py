@@ -82,6 +82,53 @@ def test_secret_paths_are_denied_not_asked() -> None:
     assert d.tier is Tier.DENY
 
 
+def test_dot_dot_cannot_walk_back_into_a_secret_path() -> None:
+    # F28: the CLI's own Bash path analysis misses this spelling -- it denied
+    # `cat ~/.ssh/id_rsa` but allowed `cat ~/.ssh/../.ssh/id_rsa`. Our pass
+    # normalises, so it must not have the same blind spot.
+    home = Path.home()
+    for command in [
+        f"cat {home}/.ssh/../.ssh/id_rsa",
+        f"cat {home}/Documents/../.ssh/id_rsa",
+        "cat ~/.ssh/./id_rsa",
+    ]:
+        assert classify("Bash", {"command": command}, SETTINGS).tier is Tier.DENY, command
+
+
+def test_secret_path_as_a_flag_value_is_caught() -> None:
+    command = f"ssh -i {Path.home()}/.ssh/id_rsa host"
+    assert classify("Bash", {"command": command}, SETTINGS).tier is Tier.DENY
+
+
+def test_relative_paths_resolve_against_the_workspace(tmp_path: Path) -> None:
+    secrets = tmp_path / "vault"
+    secrets.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    settings = Settings(workspace=workspace, secret_paths=(str(secrets),))
+
+    assert classify("Bash", {"command": "cat ../vault/key"}, settings).tier is Tier.DENY
+    assert classify("Bash", {"command": "cat ./notes.md"}, settings).tier is Tier.SANDBOXED
+
+
+def test_symlink_into_a_secret_path_is_caught(tmp_path: Path) -> None:
+    secrets = tmp_path / "vault"
+    secrets.mkdir()
+    (secrets / "key").write_text("x")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "shortcut").symlink_to(secrets)
+    settings = Settings(workspace=workspace, secret_paths=(str(secrets),))
+
+    # Planting the symlink is a write *inside* cwd, which the sandbox allows.
+    assert classify("Bash", {"command": "cat shortcut/key"}, settings).tier is Tier.DENY
+
+
+def test_path_rule_keeps_the_double_slash() -> None:
+    # F27: `Read(/abs/**)` and `Read(**/.ssh/**)` both match nothing at all.
+    assert permissions.path_rule("Read", Path("/home/x/.ssh")) == "Read(//home/x/.ssh)"
+
+
 def test_read_of_a_normal_file_is_sandboxed() -> None:
     assert classify("Read", {"file_path": "api/routes.py"}, SETTINGS).tier is Tier.SANDBOXED
 

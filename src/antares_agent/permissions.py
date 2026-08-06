@@ -25,7 +25,9 @@ Two constraints fall out of the spikes and are easy to violate by accident:
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -39,7 +41,7 @@ from claude_agent_sdk import (
 )
 
 from .config import Settings
-from .shlex_split import matches, split_commands
+from .shlex_split import matches, split_commands, tokenize
 
 log = logging.getLogger(__name__)
 
@@ -122,26 +124,68 @@ def will_sandbox(tool: str, tool_input: dict[str, Any]) -> bool:
     return True
 
 
-def secret_path_hit(text: str, secret_paths: tuple[str, ...]) -> str | None:
+def _normalisations(token: str, cwd: Path | None) -> list[Path]:
+    """Every form a path token might really denote.
+
+    Both `..` and symlinks have to collapse before comparison: F28 showed the
+    CLI's own Bash path analysis misses `<dir>/../.ssh/id_rsa`, and a symlink
+    planted inside cwd would defeat a purely lexical check.
+    """
+    path = Path(os.path.expandvars(token)).expanduser()
+    if not path.is_absolute() and cwd is not None:
+        path = cwd / path
+    forms = [Path(os.path.normpath(str(path)))]
+    with suppress(OSError, RuntimeError):  # broken symlink loop, permission denied
+        forms.append(path.resolve())
+    return forms
+
+
+def _path_tokens(text: str) -> list[str]:
+    try:
+        tokens = tokenize(text)
+    except ValueError:
+        tokens = text.split()
+    out: list[str] = []
+    for token in tokens:
+        # `--config=/path`, `-o/path`
+        for part in (token, token.partition("=")[2]):
+            if part and ("/" in part or part.startswith("~")):
+                out.append(part.lstrip("-"))
+    return out
+
+
+def secret_path_hit(
+    text: str, secret_paths: tuple[str, ...], cwd: Path | None = None
+) -> str | None:
     """Does a command or path reference a credential store?
 
     F19: the sandbox blocks writes outside cwd but not reads, so `cat
     ~/.ssh/id_rsa` succeeds silently with no approval. Deny rules cover the
-    file tools; arbitrary shell needs this substring pass.
+    file tools and, per F27, most Bash spellings too -- but not all of them,
+    so this pass has to stand on its own rather than assume the CLI got there
+    first.
     """
-    home = str(Path.home())
-    haystack = text.replace("$HOME", home).replace("${HOME}", home)
+    roots: list[tuple[str, list[Path]]] = []
     for raw in secret_paths:
-        expanded = str(Path(raw).expanduser())
-        if expanded in haystack or raw in haystack:
-            return raw
+        expanded = Path(raw).expanduser()
+        forms = [Path(os.path.normpath(str(expanded)))]
+        with suppress(OSError, RuntimeError):
+            forms.append(expanded.resolve())
+        roots.append((raw, forms))
+
+    for token in _path_tokens(text) or [text]:
+        for candidate in _normalisations(token, cwd):
+            for raw, forms in roots:
+                for root in forms:
+                    if candidate == root or root in candidate.parents:
+                        return raw
     return None
 
 
 def classify(tool: str, tool_input: dict[str, Any], settings: Settings) -> Decision:
     if tool == "Bash":
         command = str(tool_input.get("command", ""))
-        leaked = secret_path_hit(command, settings.secret_paths)
+        leaked = secret_path_hit(command, settings.secret_paths, cwd=settings.workspace)
         if leaked:
             return Decision(Tier.DENY, f"命令引用了受保护的凭据路径 {leaked}")
         for argv in split_commands(command):
@@ -159,7 +203,7 @@ def classify(tool: str, tool_input: dict[str, Any], settings: Settings) -> Decis
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
         if isinstance(value, str):
-            leaked = secret_path_hit(value, settings.secret_paths)
+            leaked = secret_path_hit(value, settings.secret_paths, cwd=settings.workspace)
             if leaked:
                 return Decision(Tier.DENY, f"路径位于受保护的凭据目录 {leaked}")
 
@@ -202,14 +246,25 @@ class Arbiter:
         return PermissionResultDeny(message=verdict.message or "用户拒绝了该操作")
 
 
+def path_rule(tool: str, path: Path) -> str:
+    """A path deny rule the CLI actually honours.
+
+    The leading `//` is load-bearing (F27). `Read(/abs/**)` with a single
+    slash and `Read(**/.ssh/**)` with no anchor both parse fine, match
+    nothing, and leak silently -- so this spelling is centralised here rather
+    than formatted at each call site.
+    """
+    return f"{tool}(//{str(path).lstrip('/')})"
+
+
 def denied_tools(settings: Settings) -> list[str]:
     """The `disallowed_tools` list. Also denies file tools on secret paths."""
     rules = list(HARD_DENY)
     for raw in settings.secret_paths:
         expanded = Path(raw).expanduser()
         for tool in ("Read", "Edit", "Write", "NotebookEdit"):
-            rules.append(f"{tool}(//{str(expanded).lstrip('/')}/**)")
-            rules.append(f"{tool}(//{str(expanded).lstrip('/')})")
+            rules.append(path_rule(tool, expanded / "**"))
+            rules.append(path_rule(tool, expanded))
     rules.extend(settings.extra_denied_tools)
     return rules
 

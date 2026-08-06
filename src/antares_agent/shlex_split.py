@@ -22,7 +22,7 @@ _ENV_ASSIGN = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*=")
 _PUNCTUATION = "();<>|&"
 
 
-def _tokenize(command: str) -> list[str]:
+def tokenize(command: str) -> list[str]:
     """Split into words *and* operators.
 
     `shlex.split` is not enough: it treats `;` as an ordinary character, so
@@ -43,7 +43,7 @@ def _tokenize(command: str) -> list[str]:
 
 def split_commands(command: str) -> list[list[str]]:
     """Yield argv lists for every command in a shell fragment."""
-    tokens = _tokenize(command)
+    tokens = tokenize(command)
 
     commands: list[list[str]] = []
     current: list[str] = []

@@ -16,6 +16,7 @@
 | F17 | auto 分类器已拦 force push | 未拦，D5 返工为显式 deny |
 | F21 | 网关可走 unix socket | 不支持，改 localhost TCP |
 | F25 | `ResultMessage` == 任务完成 | 后台 agent 活过 turn，D1 返工 |
+| F28 | CLI 的路径 deny 足以护住凭据 | 中段 `..` 可绕过，必须自己归一化 |
 
 ---
 
@@ -489,6 +490,53 @@ sonnet 的判断其实**正确遵守了 `deep` profile 里写的编排纪律**�
 deepseek 侧可能要显式写"小任务不要扇出"，否则会为琐事付两个 subagent 的成本。
 
 `deepseek-v4-flash` 基本不主动调 subagent，`deep` profile 应至少用 pro 档。
+
+---
+
+## 实现期验证（2026-08-06，写 `permissions.py` 时）
+
+### F27 ⚠️ 路径 deny 规则必须写 `//` 前缀，写错**静默失效**
+
+`01` 要求对 `~/.ssh` 等敏感目录下 deny 规则，但没写语法。实测五种写法
+（fake 密钥 + canary，控制组证明模型确实读得到）：
+
+| 写法 | 结果 |
+|---|---|
+| `Read(//abs/dir/**)` | ✅ 拦住，且 `can_use_tool` **完全没被调用**（deny 在回调之前，同 F24） |
+| `Read(//abs/dir/file)` | ✅ 拦住 |
+| `Read(/abs/dir/**)` | ❌ **泄漏** —— 单斜杠不匹配任何东西 |
+| `Read(/abs/dir/file)` | ❌ **泄漏** |
+| `Read(**/.ssh/**)` | ❌ **泄漏** —— 无锚点的纯 glob 不匹配 |
+
+三种失败写法都不报错、不警告，看起来完全正常。因此该拼写集中在
+`permissions.path_rule()` 一个函数里，并有单测钉住 `//`。
+
+**额外收获**：`Read(//dir/**)` 同时覆盖 **Bash**。`cat <abs>/id_rsa` 与
+`cat ../fakehome/.ssh/id_rsa` 都被 CLI 拒绝（`Permission to use Bash with command ... has been denied`），
+说明 CLI 对 Bash 命令做了路径解析，不只是工具名匹配。
+
+### F28 ❌ CLI 的 Bash 路径解析不折叠中段 `..` —— 必须自己归一化
+
+同一条 deny 规则下：
+
+```
+cat <vault>/id_rsa              → 拒绝
+cat <vault>/../.ssh/id_rsa      → 放行，canary 泄漏     ← 同一个文件
+```
+
+`can_use_tool` **被调用了**，说明 deny 规则压根没匹配上。Read 工具本身会归一化
+（`Read` 走 `..` 被拦住），漏的只是 **Bash 命令里的路径提取**。
+
+我原本的 `secret_path_hit` 是子串匹配，**有完全相同的盲点**。已改为：
+shlex 分词 → 取出路径样 token（含 `--flag=/path` 形式）→ `normpath` **与** `resolve()`
+双重归一 → 与敏感根做 `==` / `in parents` 比较。`resolve()` 顺带堵住软链绕过
+（`ln -s ~/.ssh ./shortcut` 是 cwd 内的写入，沙箱允许）。
+
+端到端复验（`denied_tools()` + `Arbiter` 实装）：literal / 中段 `..` / 相对路径 `..` / Read 工具
+四种写法全部拦下，其中两种是**我方拦的**；控制组读普通文件正常且静默放行（D3）。
+
+**结论**：CLI 的路径 deny 是有用的第一层，但**不能作为唯一防线**。
+`01` 的敏感路径章节据此补充。
 
 ---
 

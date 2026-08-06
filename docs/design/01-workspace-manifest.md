@@ -164,6 +164,14 @@ manifest 里不用登记。**扫描时检出跨仓库重名并报错**（F2：�
 
 先在全局硬编码；若出现仓库级需求再引入 `[[repo]].secrets` 字段。
 
+**两条实测约束（F27 / F28），缺一即形同虚设：**
+
+1. 规则必须写成 `Read(//abs/path/**)`。`Read(/abs/path/**)`（单斜杠）与
+   `Read(**/.ssh/**)`（无锚点）**不报错、不匹配、静默泄漏**。
+2. CLI 的 deny 会覆盖 Bash，但**不折叠中段 `..`** —— `cat <vault>/../.ssh/id_rsa`
+   直接放行。因此必须在 `can_use_tool` 里**自行归一化**（`normpath` + `resolve()`，
+   后者同时堵住 cwd 内软链绕过），不能依赖 CLI 那一层。
+
 ## 变更生效时机
 
 manifest 改动在**建 thread 时**重新生成索引。已有 thread 不受影响。
