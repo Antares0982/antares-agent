@@ -23,6 +23,10 @@ DEFAULT_SECRET_PATHS: tuple[str, ...] = (
     "~/.netrc",
     "~/.docker/config.json",
     "/run/secrets",
+    # agenix decrypts here on the deployment host. Unit-level perms already
+    # keep the service uid out, but the deny costs nothing and the path is not
+    # obvious from the code.
+    "/run/agenix",
 )
 
 

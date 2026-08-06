@@ -135,10 +135,17 @@ profile = `system_prompt.append` + `allowed_tools` + `permission_mode` 初值 + 
 
 ## 部署
 
-- **运行时**：uv + venv（`~/agent_work/.venv`），非 Nix。flake 只用于开发环境
+- **运行时**：uv + venv，非 Nix。flake 只用于开发环境。代码放在 `~/app`（**只读 bind 进 unit**），
+  不放 workspace 之下 —— 否则 agent 能改写决定 agent 权限的那份代码
 - **两个 systemd unit**：
-  - `antares-agent.service` —— 主进程，用户 `antares`
-  - `antares-gateway.service` —— 模型网关，独立用户，监听 localhost TCP（D4）
+  - `antares-agent.service` —— 主进程
+  - `antares-gateway.service` —— 模型网关，独立用户，监听 localhost TCP（D4）**（未实现）**
+- **跑在自己的 unix 用户 `agent` 下，不是 `antares`**（写实现时改的）。F19 是"沙箱拦写不拦读"，
+  于是服务用户能读的任何文件 agent 都能读；deny 规则是 CLI 内部的软护栏，只有 uid 是内核强制的。
+  配套用 `ProtectHome=tmpfs` + `BindPaths=` 只放回 workspace 与 `~/.claude`，
+  其余 home（`/home/antares` 等）在该 unit 的 mount namespace 里根本不存在
+- **db 与 profiles 放 `StateDirectory=`，不放 workspace** —— cwd 之下的一切 agent 都可写，
+  它自己的事件日志与 thread 存储不该在其中
 - `HOME` 必须在 unit 里显式设置（session 存储依赖它）；如需重定位可用 `CLAUDE_CONFIG_DIR`
 - **`KillMode` 保持默认的 `control-group`**。实测 F1 发现：父进程被 kill 后，孤儿 `claude` 子进程**仍会继续发模型请求**。按 cgroup 整体收割才不会每次重启攒下一批孤儿烧配额
 
@@ -184,6 +191,10 @@ KillMode=control-group                              # 默认值，别改（见�
 RestrictNamespaces=user mnt pid net ipc uts cgroup  # 必须列全，漏 mnt 即失败
 SystemCallFilter=@system-service @mount             # 缺 @mount 会被 SIGSYS 杀掉
 ```
+
+F12 测的是 bwrap，不是 CLI 自己。补测（2026-08-06，x86_64，`claude` 2.1.222）：
+`systemd-run -p MemoryDenyWriteExecute=yes claude --version` **rc=0 且正常打印版本** ——
+Bun 的 JIT 不因 W^X 禁令而挂。同一命令对照组 `false` 返回 rc=1，确认退出码确实透传。
 
 两个坑：`RestrictNamespaces=user` 看着像"放行 user"，实际是"**只**放行 user"，
 bwrap `--unshare-all` 用到的其余 namespace 全被挡；`SystemCallFilter=@system-service`

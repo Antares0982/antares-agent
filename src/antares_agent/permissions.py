@@ -108,6 +108,16 @@ NETWORK_TOOL = "SandboxNetworkAccess"
 #: Tools that only ever touch the workspace and are covered by the sandbox.
 _ALWAYS_SANDBOXED = frozenset({"Read", "Glob", "Grep", "TodoWrite", "Agent", "Task"})
 
+#: Tools that put bytes on disk at a path the model chooses.
+_WRITE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit"})
+
+#: Settings files whose `permissions.allow` entries are read back by the CLI.
+#: An allow rule is evaluated *ahead* of `can_use_tool` (F8), so a thread that
+#: can write one of these can grant itself everything tiers 2 and 3 exist to
+#: withhold -- including unsandboxed Bash. The sandbox does not stop it: these
+#: live inside cwd, which is the one place writes are permitted.
+_SETTINGS_NAMES = frozenset({"settings.json", "settings.local.json"})
+
 
 def will_sandbox(tool: str, tool_input: dict[str, Any]) -> bool:
     """Whether this call runs inside the sandbox.
@@ -182,6 +192,37 @@ def secret_path_hit(
     return None
 
 
+def _write_target(value: str, settings: Settings) -> Decision | None:
+    """Guard the two write destinations the sandbox does not cover.
+
+    The bubblewrap boundary only constrains Bash; `Edit` and `Write` are
+    executed by the CLI itself and land wherever the service uid can write.
+    Two shapes are worth intercepting, and neither is caught by a path deny
+    rule -- F27's `//`-anchored syntax needs an absolute path, and a repo's
+    `.claude/` directory can appear anywhere under cwd.
+    """
+    forms = _normalisations(value, settings.workspace)
+    for form in forms:
+        if form.name in _SETTINGS_NAMES and form.parent.name == ".claude":
+            return Decision(
+                Tier.DENY, "不允许改写 .claude 设置文件（allow 规则会绕过审批）"
+            )
+
+    roots = [Path(os.path.normpath(str(settings.workspace)))]
+    with suppress(OSError, RuntimeError):
+        roots.append(settings.workspace.resolve())
+
+    # Every form has to land inside, not just one: a symlink planted in the
+    # workspace normalises to an inside path lexically and an outside path
+    # after resolution, and it is the second one that gets written.
+    def contained(form: Path) -> bool:
+        return any(root == form or root in form.parents for root in roots)
+
+    if not all(contained(form) for form in forms):
+        return Decision(Tier.ASK, f"写入 workspace 之外的路径 {forms[0]}")
+    return None
+
+
 def classify(tool: str, tool_input: dict[str, Any], settings: Settings) -> Decision:
     if tool == "Bash":
         command = str(tool_input.get("command", ""))
@@ -202,10 +243,15 @@ def classify(tool: str, tool_input: dict[str, Any], settings: Settings) -> Decis
 
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
-        if isinstance(value, str):
-            leaked = secret_path_hit(value, settings.secret_paths, cwd=settings.workspace)
-            if leaked:
-                return Decision(Tier.DENY, f"路径位于受保护的凭据目录 {leaked}")
+        if not isinstance(value, str):
+            continue
+        leaked = secret_path_hit(value, settings.secret_paths, cwd=settings.workspace)
+        if leaked:
+            return Decision(Tier.DENY, f"路径位于受保护的凭据目录 {leaked}")
+        if tool in _WRITE_TOOLS:
+            verdict = _write_target(value, settings)
+            if verdict is not None:
+                return verdict
 
     if will_sandbox(tool, tool_input):
         return Decision(Tier.SANDBOXED)

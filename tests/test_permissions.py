@@ -124,6 +124,46 @@ def test_symlink_into_a_secret_path_is_caught(tmp_path: Path) -> None:
     assert classify("Bash", {"command": "cat shortcut/key"}, settings).tier is Tier.DENY
 
 
+def test_writing_a_claude_settings_file_is_denied(tmp_path: Path) -> None:
+    """The self-escalation path: allow rules are read before `can_use_tool`.
+
+    Both the workspace root and a nested repo count -- a repo's `.claude/`
+    appears wherever the repo does, so this cannot be a fixed deny rule.
+    """
+    workspace = tmp_path / "ws"
+    (workspace / "api" / ".claude").mkdir(parents=True)
+    settings = Settings(workspace=workspace)
+
+    for target in (
+        workspace / ".claude" / "settings.json",
+        workspace / "api" / ".claude" / "settings.local.json",
+        workspace / "api" / ".." / ".claude" / "settings.json",
+    ):
+        assert classify("Write", {"file_path": str(target)}, settings).tier is Tier.DENY, target
+
+    # Skills and other project files under .claude stay writable.
+    skill = workspace / "api" / ".claude" / "skills" / "build.md"
+    assert classify("Write", {"file_path": str(skill)}, settings).tier is Tier.SANDBOXED
+
+
+def test_writing_outside_the_workspace_is_escalated(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (workspace / "shortcut").symlink_to(outside)
+    settings = Settings(workspace=workspace)
+
+    assert classify("Write", {"file_path": "api/notes.md"}, settings).tier is Tier.SANDBOXED
+    assert classify(
+        "Edit", {"file_path": str(outside / "x.py")}, settings
+    ).tier is Tier.ASK
+    # Lexically inside, actually outside. The write follows the symlink.
+    assert classify(
+        "Write", {"file_path": "shortcut/x.py"}, settings
+    ).tier is Tier.ASK
+
+
 def test_path_rule_keeps_the_double_slash() -> None:
     # F27: `Read(/abs/**)` and `Read(**/.ssh/**)` both match nothing at all.
     assert permissions.path_rule("Read", Path("/home/x/.ssh")) == "Read(//home/x/.ssh)"

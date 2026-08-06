@@ -540,6 +540,41 @@ shlex 分词 → 取出路径样 token（含 `--flag=/path` 形式）→ `normpa
 
 ---
 
+## 部署期发现（2026-08-06，写 rpi systemd unit 时）
+
+### 沙箱完全不管 `Edit` / `Write` 的落点
+
+bubblewrap 只约束 Bash 子进程；`Edit` / `Write` / `NotebookEdit` 由 CLI 自己执行，
+落在**服务 uid 能写的任何地方**。`will_sandbox()` 对它们返回 `True`（走的是兜底分支），
+于是它们一路走到 tier 2 被静默放行。两个后果：
+
+1. **写 `<repo>/.claude/settings.json` 是提权。** 该文件的 `permissions.allow` 由 CLI
+   在 `can_use_tool` **之前**求值（F8 已实测 allow 规则会静默短路回调），
+   而它就在 cwd 之下 —— 沙箱唯一允许写的地方。一条 `Bash(*)` 即可给自己解锁
+   tier 3 全部内容，包括 `dangerouslyDisableSandbox`。
+   ⚠️ **"写进去之后确实被读回并生效"这一步尚未实测**，是从 F8 推的；
+   但拦掉它的代价是零，所以先拦，不等验证。
+2. **写 workspace 之外**同样无人拦（`~/app` 下的自身代码、`~/.claude/` 等）。
+
+已在 `classify()` 里补两条：`.claude/settings*.json` → DENY；
+落点归一化后不在 workspace 之内 → ASK。两者都用 `normpath` **与** `resolve()` 双重归一，
+且要求**每一种归一形式都在** workspace 内 —— 只要有一种在外就拦，
+否则 workspace 内的软链在词法上"在内"、实际写在外。
+
+systemd 侧同时兜底：`~/app` 以 `BindReadOnlyPaths=` 挂入，
+db / profiles 移到 `StateDirectory=`，`ProtectHome=tmpfs` 只放回 workspace 与 `~/.claude`。
+
+### `MemoryDenyWriteExecute=yes` 不影响 Bun 二进制
+
+见 `00-overview.md` 的硬化章节。F12 只对 bwrap 测过，这条补的是 CLI 自身。
+
+### nixpkgs 的 `claude-code` 已追到 2.1.222，但 rpi5 的 pin 还是 2.1.81
+
+F13 的结论对**这台机器**依旧成立（其 flake pin `d7a713c` 给的是 2.1.81）。
+若哪天顺带升了 rpi5 的 nixpkgs，可以重新考虑走 nixpkgs 路线免掉 nix-ld。
+
+---
+
 ## 待办
 
 设计定稿所需的实测已全部完成。剩余项均为"边写边验"，不影响架构：
