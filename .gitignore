@@ -1,0 +1,39 @@
+# Nix
+# gc-root symlink into /nix/store, created by the shellHook
+/.nix-pyenv
+result
+result-*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.ipynb_checkpoints/
+
+# Editors / OS
+.idea/
+*.swp
+.DS_Store
+
+# Local agent state
+.claude/settings.local.json
