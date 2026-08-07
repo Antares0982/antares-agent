@@ -1,46 +1,36 @@
 # 待办
 
-状态截至 2026-08-06：六层实现全部落地，86 个单测 + 2 个 live 测试通过，
+状态截至 2026-08-07：六层实现全部落地，95 个单测 + 2 个 live 测试通过，
 已在 Pi 上作为 systemd 服务跑起来。以下按"不做会怎样"排序，不按工作量。
 
-设计文档见 `design/00-overview.md`（决策 D1–D9）与 `design/03-verification.md`（实测 F1–F28）。
-下文凡引用 `Fnn` / `Dn` 均指这两份。
+设计文档见 `design/00-overview.md`（决策 D1–D9）、`design/04-telegram.md`（D10–D14）
+与 `design/03-verification.md`（实测 F1–F28）。下文凡引用 `Fnn` / `Dn` 均指这几份。
+
+---
+
+## ✅ 已完成（2026-08-07）
+
+- **Telegram 对接** —— 设计见 `design/04-telegram.md`。三段：`relay.py`（本仓库）、
+  `alice/modules/agent.py`（hk 上的 bot）、rpi 上的两个 unit。**代码写完，未跑过真机**
+- **API 鉴权** —— 没写鉴权代码，改成监听 unix socket（`ANTARES_SOCKET`），
+  授权交给 `RuntimeDirectoryMode=0750` 的目录。`actionrunner` / `ssrjsonrunner`
+  那条路直接消失
 
 ---
 
 ## P0 —— 现在没有它就用不了
 
-### 1. Telegram bot 对接
+### 1. 端到端跑通 Telegram
 
-唯一的入口。现在只有 HTTP/SSE，没有任何客户端。
+代码齐了但一次真机都没跑过。要验的：
 
-已经为它准备好的：
+- broker 上 exchange `agent` 能不能用那张证书 declare（**权限位没亲眼看过**）
+- socket 权限链：`agent-relay` 属于 group `agent` → 能穿过 0750 的
+  `/run/antares-agent` → 能连 0666 的 socket
+- D13 的节奏是否真的成立：一个 turn 结束后 relay 确实关流、thread 确实被 LRU 收掉
+- 媒体（图片/文档）没做。hermes 那套 base64 过总线的办法能用
 
-- `approvals.py` 的审批 id 是 `apr_` + 6 位十六进制，短到能塞进 Telegram
-  `callback_data` 的 64 字节上限
-- `events.py` 的 `_RENDER` 给每种工具标了 `none` / `summary` / `diff`，
-  折叠规则不需要适配器自己判断
-- 重连用 `GET /threads/{id}/events?after=<id>`，事件 id 跨重启连续
-- `design/02-sse-api.md` 末尾有一节"与 IM 客户端的映射（非规范）"
-
-需要自己解决的：
-
-- chat ↔ thread 的双向映射要持久化，否则重启后收到消息不知道回哪个 thread
-- 审批按钮的时序：`approval.required` 到达与用户点击之间 thread 可能已被 LRU 淘汰，
-  此时 `POST /approve` 返回 409（`api.py` 已经这么做了），适配器要把这个状态讲清楚
-- 长文本与 diff 的分片；Telegram 单条消息 4096 字符
-
-### 2. API 没有任何鉴权
-
-**这条比网关更急。** 服务监听 `127.0.0.1:60001`，没有 token、没有校验。
-Pi 上任何一个能开 shell 的用户都能 `curl` 出一个 thread 并让它跑任意任务 ——
-包括 `actionrunner` / `ssrjsonrunner` 这两个跑 GitHub Actions 的账号。
-
-选一个即可：unix socket + 文件权限（注意 F21 说的是 `ANTHROPIC_BASE_URL` 不支持
-unix socket，**我们自己的 API 不受此限**）、或者共享 token + 常量时间比较。
-前者更省事，且天然把授权交给文件系统。
-
-### 3. 模型网关（D4）
+### 2. 模型网关（D4）
 
 现状：token 从 agenix 经 `EnvironmentFile=` 进主进程环境，再由 `runner.py`
 放进 `ClaudeAgentOptions.env` 传给 CLI。文件本身是 root 400、agent uid 读不到，

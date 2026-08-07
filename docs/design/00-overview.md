@@ -26,8 +26,8 @@
 ```
 ┌─────────────┐   SSE + HTTP    ┌──────────────────────────┐
 │ IM 适配器   │◄───────────────►│  antares-agent           │
-│ (telegram/  │                 │  ├─ HTTP/SSE 层          │
-│  其他)      │                 │  ├─ thread 管理 (LRU)    │
+│ (telegram   │  （unix socket） │  ├─ HTTP/SSE 层          │
+│  经中继)    │                 │  ├─ thread 管理 (LRU)    │
 └─────────────┘                 │  ├─ 审批仲裁             │
                                 │  └─ ClaudeSDKClient × N  │
                                 └───────────┬──────────────┘
@@ -137,9 +137,14 @@ profile = `system_prompt.append` + `allowed_tools` + `permission_mode` 初值 + 
 
 - **运行时**：uv + venv，非 Nix。flake 只用于开发环境。代码放在 `~/app`（**只读 bind 进 unit**），
   不放 workspace 之下 —— 否则 agent 能改写决定 agent 权限的那份代码
-- **两个 systemd unit**：
-  - `antares-agent.service` —— 主进程
+- **三个 systemd unit**：
+  - `antares-agent.service` —— 主进程，监听 `/run/antares-agent/api.sock`
+  - `antares-agent-relay.service` —— SSE↔AMQP 中继，独立用户 `agent-relay`（见 `04-telegram.md` D12）
   - `antares-gateway.service` —— 模型网关，独立用户，监听 localhost TCP（D4）**（未实现）**
+- **API 走 unix socket，不开 TCP 口**。这个 API 自己没有鉴权，而这台机器上
+  `actionrunner` / `ssrjsonrunner` 都能开回环连接。换成 socket 之后授权交给文件系统，
+  一行鉴权代码都不用写。注意 **uvicorn 会把 socket chmod 成 0666**，
+  真正拦人的是 `RuntimeDirectoryMode=0750` 的目录 —— 只有 group `agent`（即中继）能穿过去
 - **跑在自己的 unix 用户 `agent` 下，不是 `antares`**（写实现时改的）。F19 是"沙箱拦写不拦读"，
   于是服务用户能读的任何文件 agent 都能读；deny 规则是 CLI 内部的软护栏，只有 uid 是内核强制的。
   配套用 `ProtectHome=tmpfs` + `BindPaths=` 只放回 workspace 与 `~/.claude`，
