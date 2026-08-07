@@ -250,6 +250,23 @@ def test_no_after_starts_from_now(client: TestClient) -> None:
     assert frames == []
 
 
+def test_replay_endpoint_does_not_wake_the_thread(client: TestClient) -> None:
+    # D13: the streaming endpoint revives the thread by subscribing, at ~123MB
+    # a piece (V4). Catching up on missed history must not pay that -- the
+    # relay does exactly this for every thread the bot had open when it
+    # restarted.
+    thread_id, _ = seed(client)
+    client.app.state.manager._live.clear()  # type: ignore[attr-defined]
+    before = len(client.started)  # type: ignore[attr-defined]
+
+    body = client.get(f"/v1/threads/{thread_id}/events/replay?after=1").json()
+
+    assert [e["payload"]["content"] for e in body["events"]] == ["m1", "m2"]
+    assert body["last_event_id"] == 3
+    assert body["status"] == "idle"
+    assert len(client.started) == before  # type: ignore[attr-defined]
+
+
 def test_event_ids_continue_across_a_restart(settings: Settings) -> None:
     store = Store(settings.db_path)
     try:

@@ -46,12 +46,19 @@ def main(argv: list[str] | None = None) -> int:
 
     from .api import create_app
 
-    uvicorn.run(
-        create_app(settings),
-        host=args.host or settings.host,
-        port=args.port or settings.port,
-        log_level=args.log_level,
-    )
+    app = create_app(settings)
+    # A socket, when configured, replaces the TCP listener rather than
+    # supplementing it -- leaving the port open would keep the exposure the
+    # socket exists to remove. --host/--port force TCP back on for development.
+    if settings.socket_path is not None and not (args.host or args.port):
+        uvicorn.run(app, uds=str(settings.socket_path), log_level=args.log_level)
+    else:
+        uvicorn.run(
+            app,
+            host=args.host or settings.host,
+            port=args.port or settings.port,
+            log_level=args.log_level,
+        )
     return 0
 
 

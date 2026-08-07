@@ -182,6 +182,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- events ----------------------------------------------------------
 
+    @app.get("/v1/threads/{thread_id}/events/replay")
+    async def replay(
+        thread_id: str,
+        request: Request,
+        after: int | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """History only, from sqlite, without starting the thread.
+
+        The streaming endpoint below revives the thread as a side effect of
+        subscribing (a CLI process is ~123MB, V4), which is the wrong price for
+        a client that only wants to catch up on what it missed while it was
+        down. This serves that case and leaves the thread cold.
+        """
+        mgr = manager(request)
+        if mgr.store.get_thread(thread_id) is None:
+            raise HTTPException(404, "unknown thread")
+        return {
+            "events": mgr.store.events_since(thread_id, after or 0),
+            "last_event_id": mgr.store.last_event_id(thread_id),
+            "status": str(mgr.status(thread_id)),
+        }
+
     @app.get("/v1/threads/{thread_id}/events")
     async def events(
         thread_id: str,

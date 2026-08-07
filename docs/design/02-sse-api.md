@@ -22,6 +22,7 @@ Base：`http://127.0.0.1:<port>/v1`（或 unix socket）。单人使用，鉴权
 | `GET` | `/threads/{id}` | 详情 |
 | `DELETE` | `/threads/{id}` | 删除（软删）。取消进行中任务，释放挂起审批 |
 | `GET` | `/threads/{id}/events` | **SSE 流**。`?after=<event_id>` 从该事件之后重放 |
+| `GET` | `/threads/{id}/events/replay` | 只补历史，**不唤醒线程**。返回 JSON |
 | `POST` | `/threads/{id}/messages` | 发消息。`{text}`。立即返回 `202`，结果走事件流 |
 | `POST` | `/threads/{id}/approve` | 提交审批。`{approval_id, decision, message?}` |
 | `POST` | `/threads/{id}/interrupt` | 打断当前 turn |
@@ -237,6 +238,20 @@ GET /threads/{id}/events?after=evt_000117
 服务端保留最近 N 条事件（内存环形缓冲 + sqlite 落盘）。客户端断线后带上最后见到的 `event_id` 重连，服务端补齐缺口再转入实时流。
 
 这比"开流 → 拉历史 → 按 id 去重"简单，且**能保证不漏掉审批请求** —— 后者的失败模式是：断线期间某个 subagent 挂起等审批，重连后收不到该事件，thread 永久卡在 `awaiting_approval`。
+
+### `/events/replay` —— 只要历史，不要进程
+
+⚠️ **打开 SSE 流会唤醒线程**：端点内部走 `ThreadManager.runner()`，没活着就把它复活，
+代价是一个 ~123MB 的 CLI 进程（V4）。对"我断线期间错过了什么"这个问题，这个价钱是错的。
+
+```
+GET /threads/{id}/events/replay?after=117
+→ { "events": [{"type": …, "payload": {…}}, …], "last_event_id": 129, "status": "idle" }
+```
+
+纯 sqlite 读，线程保持冷的。客户端据 `status` 决定要不要再开真正的流跟下去。
+客户端重启后对每个活跃 thread 逐个补历史，就靠这个端点；用 SSE 流做同样的事
+会把所有 thread 一次性拉起来，直接顶满 `max_live_threads`。
 
 ## 与 IM 客户端的映射（非规范）
 

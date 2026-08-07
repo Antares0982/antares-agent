@@ -12,8 +12,17 @@ dependencies = [
     "sse-starlette>=2.1",
 ]
 
+[project.optional-dependencies]
+# The relay is a separate process under a separate uid (D12), so the service
+# never imports these -- they are here only so one `uv sync` builds both.
+relay = [
+    "aio-pika>=9.4",
+    "httpx>=0.27",
+]
+
 [project.scripts]
 antares-agent = "antares_agent.__main__:main"
+antares-agent-relay = "antares_agent.relay:main"
 
 [dependency-groups]
 dev = [

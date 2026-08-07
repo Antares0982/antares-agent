@@ -67,6 +67,14 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 60001
 
+    #: Listen on a unix socket instead of TCP. Set in production: the relay is
+    #: the only client, and a socket hands authorisation to the filesystem
+    #: rather than to code we would otherwise have to write. Without it the API
+    #: is reachable by every uid on the host that can open a loopback socket.
+    #: F21 does not apply here -- that is about ANTHROPIC_BASE_URL, not our own
+    #: listener.
+    socket_path: Path | None = None
+
     db_path: Path = field(
         default_factory=lambda: Path("~/agent_work/.agent/antares.db").expanduser()
     )
@@ -109,6 +117,7 @@ class Settings:
             gateway_auth_token=token,
             host=_env("HOST", "127.0.0.1") or "127.0.0.1",
             port=_env_int("PORT", 60001),
+            socket_path=_env_path("SOCKET"),
             db_path=_env_path("DB_PATH") or workspace / ".agent" / "antares.db",
             profiles_dir=_env_path("PROFILES_DIR") or workspace / ".agent" / "profiles",
             approval_timeout_s=_env_int("APPROVAL_TIMEOUT", 600),
