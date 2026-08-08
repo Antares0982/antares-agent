@@ -105,6 +105,49 @@ async def test_a_thread_already_busy_needs_no_fresh_busy_event() -> None:
     assert len(relay.published) == 1
 
 
+async def test_a_failed_publish_is_retried_from_the_event_that_failed() -> None:
+    """The cursor may only pass an event the broker has acknowledged.
+
+    Publishes are confirmed, so a failure is known rather than silent -- but
+    only if the cursor lags it. Advancing first would make the reconnect ask
+    for events *after* the one that was lost, and it would never be sent.
+    """
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            attempts.append(request.url.params.get("after", ""))
+            return httpx.Response(
+                200,
+                content=sse(
+                    [
+                        event(2, "thread.status", status="busy"),
+                        event(3, "text", content="lost"),
+                        event(4, "thread.status", status="idle"),
+                    ]
+                ),
+            )
+        return httpx.Response(200, json={"status": "idle"})
+
+    relay = relay_over(handler)
+    failed: list[str] = []
+    original = relay._publish
+
+    async def flaky(type_: str, payload: dict[str, Any]) -> None:
+        if payload.get("content") == "lost" and not failed:
+            failed.append(type_)
+            raise RuntimeError("broker went away")
+        await original(type_, payload)
+
+    relay._publish = flaky  # type: ignore[method-assign]
+    relay._retry_delay = 0  # type: ignore[attr-defined]
+    await relay._follow_until_idle("thr_x", after=1)
+
+    # Second attempt resumes at 2 -- the last confirmed event -- not at 3.
+    assert attempts == ["1", "2"]
+    assert [p.get("content") for _, p in relay.published] == [None, None, "lost", None]
+
+
 async def test_one_follower_per_thread() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/events"):

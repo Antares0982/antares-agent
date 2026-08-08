@@ -69,6 +69,10 @@ _TIMEOUT = httpx.Timeout(30.0, read=None)
 
 
 class Relay:
+    #: Pause before re-opening a dropped stream. Reconnecting immediately would
+    #: spin against whatever caused the drop.
+    _retry_delay = 3.0
+
     def __init__(self, http: httpx.AsyncClient) -> None:
         self._http = http
         self._exchange: aio_pika.abc.AbstractExchange | None = None
@@ -221,8 +225,13 @@ class Relay:
         while True:
             try:
                 async for type_, payload in self._stream(thread_id, cursor):
-                    cursor = _event_id(payload) or cursor
+                    # Advanced only once the broker has confirmed the publish
+                    # (aio_pika confirms by default), never before. Bumping it
+                    # first would make the retry below resume *past* the event
+                    # that failed to publish, quietly dropping it -- and the
+                    # confirm exists precisely so that cannot happen.
                     await self._publish(type_, payload)
+                    cursor = _event_id(payload) or cursor
                     if type_ != "thread.status":
                         continue
                     if payload.get("status") == "idle" and seen_busy:
@@ -236,7 +245,7 @@ class Relay:
                 # replays the gap, so a dropped connection costs latency and
                 # nothing else.
                 log.warning("stream for %s dropped at %s (%s); retrying", thread_id, cursor, exc)
-                await asyncio.sleep(3)
+                await asyncio.sleep(self._retry_delay)
                 continue
             # A clean end of stream without idle means the server closed it
             # (shutdown, eviction). Reconnecting would revive the thread, so
