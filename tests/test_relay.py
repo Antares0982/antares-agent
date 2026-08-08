@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-from antares_agent.relay import Relay
+from antares_agent.relay import Relay, RelayError
 
 
 def sse(frames: list[tuple[str, dict[str, Any]]]) -> bytes:
@@ -233,6 +233,64 @@ async def test_message_posts_then_follows() -> None:
     assert relay.published == [
         ("thread.status", {"id": "evt_000003", "thread_id": "thr_x", "status": "idle"})
     ]
+
+
+async def test_switch_reads_the_thread_before_binding_the_chat_to_it() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "thread_id": "thr_b",
+                "profile": "deep",
+                "summary": "重构索引",
+                "status": "idle",
+                "last_event_id": 42,
+            },
+        )
+
+    relay = relay_over(handler)
+    await relay._dispatch({"op": "switch", "thread_id": "thr_b", "chat_id": "7"})
+
+    assert paths == ["/v1/threads/thr_b"]
+    type_, payload = relay.published[0]
+    assert type_ == "relay.thread_bound"
+    assert payload["chat_id"] == "7" and payload["last_event_id"] == 42
+
+
+async def test_switching_to_a_thread_that_does_not_exist_fails_loudly() -> None:
+    # Otherwise the chat binds to a typo and every later command fails one at
+    # a time, with nothing pointing at the cause.
+    relay = relay_over(lambda r: httpx.Response(404, json={"detail": "unknown thread"}))
+    with pytest.raises(RelayError) as caught:
+        await relay._dispatch({"op": "switch", "thread_id": "thr_typo", "chat_id": "7"})
+    assert caught.value.status == 404
+    assert relay.published == []
+
+
+async def test_new_thread_and_switch_publish_the_same_envelope() -> None:
+    # One envelope, because the bot does the same thing either way. A second
+    # name would be a second code path to keep in step.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"thread_id": "thr_a", "profile": "quick"})
+
+    relay = relay_over(handler)
+    await relay._dispatch({"op": "new_thread", "chat_id": "7"})
+    assert relay.published[0][0] == "relay.thread_bound"
+    assert relay.published[0][1]["thread_id"] == "thr_a"
+
+
+async def test_list_passes_the_threads_through_untouched() -> None:
+    threads = [
+        {"thread_id": "thr_a", "summary": "a", "status": "idle"},
+        {"thread_id": "thr_b", "summary": "b", "status": "busy"},
+    ]
+    relay = relay_over(lambda r: httpx.Response(200, json={"threads": threads}))
+    await relay._dispatch({"op": "list", "chat_id": "7"})
+
+    assert relay.published == [("relay.thread_list", {"chat_id": "7", "threads": threads})]
 
 
 async def test_unknown_op_is_reported_not_swallowed() -> None:

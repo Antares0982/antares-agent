@@ -73,6 +73,8 @@ agent 侧才能后续编辑它（`alice/modules/hermes.py:379-391`）。
 
 ```jsonc
 {"op": "new_thread", "chat_id": "…", "profile": "deep"}
+{"op": "switch",    "thread_id": "thr_…", "chat_id": "…"}
+{"op": "list",      "chat_id": "…"}
 {"op": "message",   "thread_id": "thr_…", "text": "…"}
 {"op": "approve",   "thread_id": "thr_…", "approval_id": "apr_…", "decision": "allow", "message": ""}
 {"op": "interrupt", "thread_id": "thr_…"}
@@ -81,7 +83,19 @@ agent 侧才能后续编辑它（`alice/modules/hermes.py:379-391`）。
 ```
 
 relay 对每个 `op` 做的事就是一次 HTTP 请求，失败则回一条
-`agent.event` / `type: "error"`，让 alice 有话可说。
+`relay.cmd_failed`，让 alice 有话可说。
+
+relay 自己产生三种信封，与 agent 事件共用 `agent.event`，用 `relay.` 前缀区分：
+
+| 信封 | 何时 |
+|---|---|
+| `relay.thread_bound` | `new_thread` 与 `switch` **共用** —— bot 两种情况下做的事一样 |
+| `relay.thread_list` | `list` 的结果，`GET /v1/threads` 原样透传 |
+| `relay.cmd_failed` | 任何 op 抛错，带 `op` / `chat_id` / `detail` |
+
+`switch` 先 `GET /v1/threads/{id}` 再回 `thread_bound`，不直接信任 id ——
+否则打错一个字符就把 chat 绑到不存在的 thread 上，之后每条命令各失败一次，
+没有任何一条指向原因。这个端点不唤醒线程（`manager.status()` 只读活跃表）。
 
 ### 丢消息
 
@@ -136,10 +150,24 @@ POST /messages  →  打开 ?after=<last>  →  跟流  →  见 thread.status:i
 `modules/agent.py`，一个 `TelegramBotModuleBase`。Hermes 模块在本分支第一个提交里已删除 ——
 两者会抢同一个 plain-message handler，且都要为 agent 流量绑队列。
 
-**映射**：`chat_id → (thread_id, last_event_id)`，存 `data/agent.db`
-（用 `antares_bot.sqlite`，`modules/gpt.py` 已经是这个用法）。
-一个 chat 一个「当前 thread」，`/new` 轮换。forum topics 对应 agent 树是更好的形态，
-但那是第二步，先让单 thread 跑起来。
+**映射**：存 `data/agent.db`（用 `antares_bot.sqlite`，`modules/gpt.py` 已经是这个用法），
+主键是 **`(chat, thread)`**，每行带 `cursor` 与 `current` 标记。
+
+主键不是 `chat` 单列，这一点是必须的：一个 chat 一行的话，`/switch` 走开的瞬间
+就把原 thread 的 cursor 冲掉了，切回来会把它**整段历史重放**进聊天。
+所以切走的 thread 连同 cursor 一起留着，只是不再是 `current`。
+
+`/threads` 列出全部（数据来自 `GET /v1/threads` 而非 bot 自己记的，
+所以别处建的 thread 也点得到），每条一个按钮，`callback_data = "ags:<thread_id>"`，
+20 字节。`/switch <id>` 是打字的备用入口。
+
+**切走的 thread 不会被静音。** 它可能还在跑，结果照样送进这个聊天 ——
+凭空丢掉一段工作比多几条消息糟得多。区分靠状态消息带上 `⟨thr_…⟩` 前缀
+（前缀只加在状态消息上：正文是带预计算 markdown entity 发的，
+前置任何字符都会让 offset 整体错位）。
+
+**已知限制**：两个 thread 同时输出正文时会交错，只有状态消息能区分来源。
+forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第二步。
 
 **输出节奏**：不做逐 delta 流式编辑。文本累积，遇 `tool.call` / `turn.done` / 超长时 flush，
 用现成的 `longtext_markdown_split`。另开一条状态消息，1 秒节流 edit，

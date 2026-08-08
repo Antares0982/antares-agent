@@ -62,7 +62,11 @@ QUEUE_MAX_LEN = int(os.environ.get("QUEUE_MAX_LEN", 5000))
 #: Relay-originated envelopes. They share `agent.event` with real agent events
 #: so the bot has one dispatch, and they are namespaced so it can tell them
 #: apart from anything the agent itself will ever emit.
-THREAD_CREATED = "relay.thread_created"
+#: One envelope for both `new_thread` and `switch`: the bot does the same
+#: thing either way -- point the chat at a thread -- and a second name would
+#: only mean a second code path that has to stay in step with the first.
+THREAD_BOUND = "relay.thread_bound"
+THREAD_LIST = "relay.thread_list"
 CMD_FAILED = "relay.cmd_failed"
 
 _TIMEOUT = httpx.Timeout(30.0, read=None)
@@ -146,11 +150,13 @@ class Relay:
 
         if op == "new_thread":
             body = {"profile": cmd.get("profile")} if cmd.get("profile") else {}
-            reply = await self._post("/v1/threads", body)
+            await self._bind(await self._post("/v1/threads", body), cmd.get("chat_id"))
+            return
+
+        if op == "list":
+            reply = await self._get("/v1/threads")
             await self._publish(
-                THREAD_CREATED,
-                {"thread_id": reply["thread_id"], "chat_id": cmd.get("chat_id"),
-                 "profile": reply.get("profile")},
+                THREAD_LIST, {"chat_id": cmd.get("chat_id"), "threads": reply["threads"]}
             )
             return
 
@@ -176,8 +182,34 @@ class Relay:
                 await self._post(f"/v1/threads/{thread_id}/mode", {"mode": cmd["mode"]})
             case "resume":
                 await self._resume(thread_id, cmd.get("after"))
+            case "switch":
+                # Reads the thread rather than trusting the id: a typo would
+                # otherwise bind the chat to something that does not exist, and
+                # every later command would fail one at a time instead of once.
+                # This endpoint does not wake the thread (manager.status only
+                # reads the live map).
+                await self._bind(await self._get(f"/v1/threads/{thread_id}"), cmd.get("chat_id"))
             case _:
                 raise ValueError(f"unknown op {op!r}")
+
+    async def _bind(self, thread: dict[str, Any], chat_id: Any) -> None:
+        await self._publish(
+            THREAD_BOUND,
+            {
+                "chat_id": chat_id,
+                "thread_id": thread["thread_id"],
+                "profile": thread.get("profile"),
+                "summary": thread.get("summary"),
+                "status": thread.get("status"),
+                "last_event_id": thread.get("last_event_id"),
+            },
+        )
+
+    async def _get(self, path: str, **params: Any) -> dict[str, Any]:
+        response = await self._http.get(path, params=params or None)
+        if response.status_code >= 400:
+            raise RelayError(response.status_code, _detail(response))
+        return response.json()
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         response = await self._http.post(path, json=body)
@@ -194,12 +226,7 @@ class Relay:
         catching up after a bot restart does not spin up a CLI process for
         every thread the bot happened to have open.
         """
-        response = await self._http.get(
-            f"/v1/threads/{thread_id}/events/replay", params={"after": after or 0}
-        )
-        if response.status_code >= 400:
-            raise RelayError(response.status_code, _detail(response))
-        data = response.json()
+        data = await self._get(f"/v1/threads/{thread_id}/events/replay", after=after or 0)
         for event in data["events"]:
             await self._publish(event["type"], event["payload"])
         if data["status"] != "idle":
