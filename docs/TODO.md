@@ -29,6 +29,10 @@
   `/run/antares-agent` → 能连 0666 的 socket
 - D13 的节奏是否真的成立：一个 turn 结束后 relay 确实关流、thread 确实被 LRU 收掉
 - 媒体（图片/文档）没做。hermes 那套 base64 过总线的办法能用
+- 多个 thread 同时输出正文会交错，只有状态消息带的 `⟨thr_…⟩` 前缀能区分来源。
+  正解是 forum topics 的 `message_thread_id`
+
+`/threads` 与 `/switch` 已经做了（2026-08-08），thread 不会再被 `/new` 顶掉找不回来。
 
 ### 2. 模型网关（D4）
 
