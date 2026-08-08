@@ -23,7 +23,7 @@ Base：`http://127.0.0.1:<port>/v1`（或 unix socket）。单人使用，鉴权
 | `DELETE` | `/threads/{id}` | 删除（软删）。取消进行中任务，释放挂起审批 |
 | `GET` | `/threads/{id}/events` | **SSE 流**。`?after=<event_id>` 从该事件之后重放 |
 | `GET` | `/threads/{id}/events/replay` | 只补历史，**不唤醒线程**。返回 JSON |
-| `POST` | `/threads/{id}/messages` | 发消息。`{text}`。立即返回 `202`，结果走事件流 |
+| `POST` | `/threads/{id}/messages` | 发消息。`{text?, attachments?}`。立即返回 `202`，结果走事件流 |
 | `POST` | `/threads/{id}/approve` | 提交审批。`{approval_id, decision, message?}` |
 | `POST` | `/threads/{id}/interrupt` | 打断当前 turn |
 | `POST` | `/threads/{id}/mode` | 热切 permission mode。`{mode}` |
@@ -31,6 +31,32 @@ Base：`http://127.0.0.1:<port>/v1`（或 unix socket）。单人使用，鉴权
 | `POST` | `/threads/{id}/undo` | 文件回滚。`{message_id}` → `rewind_files()` |
 
 `POST /messages` 立即返回而非等待完成，是为了让"排队"（D1）在协议上自然表达：thread busy 时消息入队，客户端从事件流里看到 `queued`。
+
+### 附件
+
+```jsonc
+{
+  "text": "这张图哪里不对",          // 可以为空，只要有附件
+  "attachments": [
+    {"name": "screen.png", "mime": "image/png", "data_b64": "iVBORw0…"}
+  ]
+}
+```
+
+**落盘成文件，不进 content block。** 附件写到 `<workspace>/<scratch>/inbox/<thread_id>/`，
+prompt 里附一行路径，模型用 `Read` 打开 —— 图片 `Read` 原生就会渲染。
+这样换来三件事：不必新增事件类型或 SDK 消息形态；文件能活过 thread 淘汰与
+`resume`（塞进 prompt 的 blob 不能）；`Read` 本来就在沙箱白名单里，不额外过审批。
+
+两条约束是安全性的，不是风格：
+
+- **`name` 只当散文用，绝不进路径**。它来自 IM，`../` 会把文件写到任意位置。
+  盘上的文件名是我们生成的，`name` 只出现在 prompt 文本里
+- **后缀由 `mime` 推**，不由 `name` 推。后缀决定 CLI 会不会把它当图片读，
+  这个判断不该由发送方做；`mime` 认不出就是 `.bin`
+
+单个附件上限 28MB（base64 后），一条消息最多 10 个，超出是 `422`。
+base64 解不开也是 `422`，不是 `500`。
 
 ## 事件信封
 

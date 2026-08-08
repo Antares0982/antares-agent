@@ -187,7 +187,16 @@ class Relay:
 
         match op:
             case "message":
-                await self._post(f"/v1/threads/{thread_id}/messages", {"text": cmd["text"]})
+                # `attachments` is passed through untouched: the relay knows
+                # only that the API will validate it, which is the same thing
+                # it knows about every other field here.
+                await self._post(
+                    f"/v1/threads/{thread_id}/messages",
+                    {
+                        "text": cmd.get("text", ""),
+                        "attachments": cmd.get("attachments") or [],
+                    },
+                )
                 self._follow(thread_id, cmd.get("after"))
             case "approve":
                 await self._post(

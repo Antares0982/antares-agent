@@ -8,6 +8,8 @@ See docs/design/02-sse-api.md.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -15,25 +17,46 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
 from . import index, preflight
 from . import profiles as profiles_mod
 from .approvals import UnknownApproval
 from .config import Settings
-from .manager import ThreadManager, UnknownProfile, UnknownThread
+from .manager import Attachment, ThreadManager, UnknownProfile, UnknownThread
 from .store import Store
 
 log = logging.getLogger(__name__)
+
+#: Ceiling on one base64-encoded attachment. Telegram will not hand a bot
+#: anything past 20MB, and this is the room that takes; the number matters
+#: only because an unbounded string here is a memory bomb in a process that
+#: is already holding several CLI sessions (V4).
+MAX_ATTACHMENT_B64 = 28_000_000
 
 
 class NewThread(BaseModel):
     profile: str | None = None
 
 
+class AttachmentIn(BaseModel):
+    name: str = Field("", max_length=256)
+    mime: str = Field("", max_length=128)
+    data_b64: str = Field(min_length=1, max_length=MAX_ATTACHMENT_B64)
+
+
 class NewMessage(BaseModel):
-    text: str = Field(min_length=1)
+    text: str = ""
+    attachments: list[AttachmentIn] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> NewMessage:
+        # `text` alone can no longer carry this: a photo with no caption is a
+        # perfectly good message, and an empty one is still not.
+        if not self.text.strip() and not self.attachments:
+            raise ValueError("需要 text 或 attachments")
+        return self
 
 
 class Approval(BaseModel):
@@ -144,7 +167,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # (D1) has a natural expression: the client learns its position from
         # the event stream instead of a blocked request.
         try:
-            position = await manager(request).send(thread_id, body.text)
+            # Decoded here so bad base64 is a 422 about the request rather
+            # than a 500 from somewhere deeper.
+            attachments = [
+                Attachment(a.name, a.mime, base64.b64decode(a.data_b64, validate=True))
+                for a in body.attachments
+            ]
+        except binascii.Error as exc:
+            raise HTTPException(422, "attachment is not valid base64") from exc
+        try:
+            position = await manager(request).send(thread_id, body.text, attachments)
         except UnknownThread as exc:
             raise HTTPException(404, "unknown thread") from exc
         return {"status": "queued" if position else "accepted", "position": position}

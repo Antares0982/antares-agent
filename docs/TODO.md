@@ -15,6 +15,12 @@
 - **API 鉴权** —— 没写鉴权代码，改成监听 unix socket（`ANTARES_SOCKET`），
   授权交给 `RuntimeDirectoryMode=0750` 的目录。`actionrunner` / `ssrjsonrunner`
   那条路直接消失
+- **端到端跑通**（2026-08-08）—— Telegram → alice → broker → relay → agent 全程真机验过。
+  路上踩到的两个坑都不在代码里：relay 连错 vhost（`agent.cmd` 建在 `tri-lug`、
+  alice 在 `remotecall`，topic exchange 无绑定即静默丢弃），以及 alice 的
+  `AGENT_THREADS` 表是旧 schema —— `create_or_validate()` 只认表名不认列，改了列要删库
+- **图片/文件输入**（2026-08-08）—— 落盘成文件、prompt 里给路径，模型用 `Read` 打开，
+  不走 content block。形状见 `02-sse-api.md`「附件」。**只做了进来的方向**
 - **崩溃对账**（2026-08-08）—— `ThreadManager.recover()` 在启动时补齐进程死在 turn
   中间留下的东西：没配上 `resolved` 的审批推 `approval_lost`，状态一律补回 `idle`。
   判据取自自己的事件日志而非 CLI session 文件（理由见 `02-sse-api.md`）。
@@ -24,21 +30,20 @@
 
 ## P0 —— 现在没有它就用不了
 
-### 1. 端到端跑通 Telegram
+### 1. Telegram 上还没验过的路径
 
-代码齐了但一次真机都没跑过。要验的：
+基本链路通了（见上）。剩下这些只在单测或假总线上成立过：
 
-- broker 上 exchange `agent` 能不能用那张证书 declare（**权限位没亲眼看过**）
-- socket 权限链：`agent-relay` 属于 group `agent` → 能穿过 0750 的
-  `/run/antares-agent` → 能连 0666 的 socket
 - D13 的节奏是否真的成立：一个 turn 结束后 relay 确实关流、thread 确实被 LRU 收掉
 - 崩溃对账：`systemctl restart` 打在挂起审批上，看 Telegram 里按钮是否被收掉、
   是否只报一次。单测覆盖了对账本身，`relay.online` → `resume` 这一跳只在假总线上验过
-- 媒体（图片/文档）没做。hermes 那套 base64 过总线的办法能用
+- 图片进来之后模型是否真的 `Read` 了它 —— 路径写进 prompt 是我们的约定，
+  "看到路径就去读"是模型的行为，没实测过
 - 多个 thread 同时输出正文会交错，只有状态消息带的 `⟨thr_…⟩` 前缀能区分来源。
   正解是 forum topics 的 `message_thread_id`
+- agent → Telegram 方向的图片没做（现在只有 diff 会以文件形式回传）
 
-`/threads` 与 `/switch` 已经做了（2026-08-08），thread 不会再被 `/new` 顶掉找不回来。
+broker 权限已核对：`remotecall` 上 `hermes` 是 `.*/.*/.*`，declare exchange `agent` 没问题。
 
 ### 2. 模型网关（D4）
 
@@ -90,12 +95,11 @@
 - **部署是手工的**：`git clone` + `uv sync`，没有脚本、没有回滚。
   升级 SDK 后要记得重启服务（bundled `claude` 路径由 launcher 脚本 glob 出来，
   版本号变了不用改 unit，但进程不会自己发现）
-- **仓库还没有 remote**
 - **`secrets/secrets.nix` 在 Nix 仓库里是 gitignore 的**，所以
   `"antares-agent-env.age".publicKeys = publicKeys;` 那一行只存在于本地，
   Pi 上的 checkout 需要手动补 —— 否则那台机器上 `agenix -e` 认不出这个 secret
 - **sqlite 的 `events` 表无限增长**，没有清理与 vacuum。thread 是软删的，
-  删掉的 thread 的事件也还在
+  删掉的 thread 的事件也还在。`.agent/inbox/<thread_id>/` 里的附件同理
 - **没有"重扫工作区"的入口**：索引只在 `ThreadManager.create()` 时写。
   往 `workspace.toml` 加了仓库之后，不建新 thread 就不会刷新
 - **`/v1/health` 不报告沙箱自检结果**。`preflight.run()` 在 lifespan 里跑，

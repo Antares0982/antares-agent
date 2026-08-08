@@ -14,8 +14,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import mimetypes
 import secrets
 from collections import OrderedDict
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from . import index
 from . import manifest as manifest_mod
@@ -36,6 +39,19 @@ class UnknownThread(KeyError):
 
 class UnknownProfile(KeyError):
     pass
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """A file that arrived with a message, already decoded.
+
+    `name` is whatever the sender called it and is never used as a path --
+    see `ThreadManager._stash`.
+    """
+
+    name: str
+    mime: str
+    data: bytes
 
 
 class ThreadManager:
@@ -150,15 +166,50 @@ class ThreadManager:
 
     # -- input -----------------------------------------------------------
 
-    async def send(self, thread_id: str, text: str) -> int | None:
+    async def send(
+        self, thread_id: str, text: str, attachments: Sequence[Attachment] = ()
+    ) -> int | None:
         runner = await self.runner(thread_id)
-        position = await runner.send(text)
+        position = await runner.send(self._stash(runner, text, attachments))
         self.store.touch(
             thread_id,
             session_id=runner.state.session_id,
             summary=runner.state.summary,
         )
         return position
+
+    def _stash(
+        self, runner: ThreadRunner, text: str, attachments: Sequence[Attachment]
+    ) -> str:
+        """Put attachments on disk and name them in the prompt.
+
+        A path is the whole mechanism. `Read` renders images natively and is
+        already sandboxed, so an image only has to exist somewhere the model
+        may open -- there is no second content-block channel to build, and no
+        event type or SDK shape to keep in step with it. It also outlives the
+        turn: a blob inlined into a prompt is gone once the thread is evicted,
+        a file is still there when it resumes.
+
+        The sender's filename never becomes a path component. It comes from
+        Telegram, so a `../` in it would put the file wherever it liked. The
+        name on disk is ours; theirs is repeated as prose, where it can
+        mislead the model but not the filesystem.
+        """
+        if not attachments:
+            return text
+
+        inbox = self.settings.workspace / runner.manifest.scratch / "inbox" / runner.thread_id
+        inbox.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        for item in attachments:
+            path = inbox / (secrets.token_hex(4) + _suffix(item.mime))
+            path.write_bytes(item.data)
+            kind = "图片" if item.mime.startswith("image/") else "文件"
+            named = f" {item.name}" if item.name else ""
+            lines.append(f"[用户发来{kind}{named}]：{path}")
+        # Below the caption, not above it: the first line becomes the thread's
+        # summary, and a file path is a poor name for a conversation.
+        return "\n".join([*([text] if text else []), *lines])
 
     def event_log(self, thread_id: str) -> EventLog | None:
         return self._logs.get(thread_id)
@@ -227,3 +278,14 @@ class ThreadManager:
         """
         event = Event(type=type_, thread_id=thread_id, data=data)
         self.store.append_event(event.with_id(self.store.last_event_id(thread_id) + 1))
+
+
+def _suffix(mime: str) -> str:
+    """The extension to store an attachment under, from its mime type.
+
+    Not from the sender's filename, because the extension is what decides
+    whether the CLI reads the file as an image at all, and that call should
+    not be theirs to make. `.bin` when the mime says nothing: read as bytes,
+    which is the honest answer for something nobody described.
+    """
+    return mimetypes.guess_extension(mime) or ".bin"

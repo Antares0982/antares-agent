@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -38,6 +39,8 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         def __init__(self, thread_id: str, event_log: Any) -> None:
             self.state = type("S", (), {"session_id": "sess", "summary": "", "status": "idle"})()
             self.log = event_log
+            self.thread_id = thread_id
+            self.manifest = type("M", (), {"scratch": ".agent"})()
             self.sent: list[str] = []
             self.busy = False
             self.mode: str | None = None
@@ -165,6 +168,74 @@ def test_post_message_returns_immediately(client: TestClient) -> None:
 def test_empty_message_is_rejected(client: TestClient) -> None:
     thread_id = new_thread(client)
     assert client.post(f"/v1/threads/{thread_id}/messages", json={"text": ""}).status_code == 422
+
+
+# --- attachments ---------------------------------------------------------
+
+PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n rest of a png").decode()
+
+
+def test_an_attachment_lands_in_the_workspace_and_is_named_in_the_prompt(
+    client: TestClient, settings: Settings
+) -> None:
+    thread_id = new_thread(client)
+    response = client.post(
+        f"/v1/threads/{thread_id}/messages",
+        json={
+            "text": "这张图哪里不对",
+            "attachments": [{"name": "screen.png", "mime": "image/png", "data_b64": PNG}],
+        },
+    )
+    assert response.status_code == 202
+
+    inbox = settings.workspace / ".agent" / "inbox" / thread_id
+    written = list(inbox.iterdir())
+    assert len(written) == 1
+    assert written[0].suffix == ".png"  # from the mime type, not the sender's name
+    assert written[0].read_bytes() == base64.b64decode(PNG)
+
+    prompt = client.started[-1].sent[0]  # type: ignore[attr-defined]
+    # Caption first: it is what becomes the thread's summary.
+    assert prompt.startswith("这张图哪里不对\n")
+    assert str(written[0]) in prompt
+    assert "screen.png" in prompt
+
+
+def test_a_caption_is_optional(client: TestClient) -> None:
+    thread_id = new_thread(client)
+    response = client.post(
+        f"/v1/threads/{thread_id}/messages",
+        json={"attachments": [{"name": "a.png", "mime": "image/png", "data_b64": PNG}]},
+    )
+    assert response.status_code == 202
+    assert client.started[-1].sent[0].startswith("[用户发来图片")  # type: ignore[attr-defined]
+
+
+def test_the_senders_name_cannot_choose_the_path(
+    client: TestClient, settings: Settings
+) -> None:
+    thread_id = new_thread(client)
+    client.post(
+        f"/v1/threads/{thread_id}/messages",
+        json={
+            "text": "hi",
+            "attachments": [
+                {"name": "../../../../etc/evil.png", "mime": "image/png", "data_b64": PNG}
+            ],
+        },
+    )
+    inbox = settings.workspace / ".agent" / "inbox" / thread_id
+    assert [p.parent for p in inbox.iterdir()] == [inbox]
+    assert not (settings.workspace.parent / "evil.png").exists()
+
+
+def test_undecodable_base64_is_a_422_not_a_500(client: TestClient) -> None:
+    thread_id = new_thread(client)
+    response = client.post(
+        f"/v1/threads/{thread_id}/messages",
+        json={"text": "hi", "attachments": [{"mime": "image/png", "data_b64": "not base64!!"}]},
+    )
+    assert response.status_code == 422
 
 
 def test_mode_switch(client: TestClient) -> None:

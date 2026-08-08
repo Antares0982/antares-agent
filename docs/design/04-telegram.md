@@ -75,7 +75,7 @@ agent 侧才能后续编辑它（`alice/modules/hermes.py:379-391`）。
 {"op": "new_thread", "chat_id": "…", "profile": "deep"}
 {"op": "switch",    "thread_id": "thr_…", "chat_id": "…"}
 {"op": "list",      "chat_id": "…"}
-{"op": "message",   "thread_id": "thr_…", "text": "…"}
+{"op": "message",   "thread_id": "thr_…", "text": "…", "attachments": []}
 {"op": "approve",   "thread_id": "thr_…", "approval_id": "apr_…", "decision": "allow", "message": ""}
 {"op": "interrupt", "thread_id": "thr_…"}
 {"op": "mode",      "thread_id": "thr_…", "mode": "plan"}
@@ -167,6 +167,15 @@ POST /messages  →  打开 ?after=<last>  →  跟流  →  见 thread.status:i
 （前缀只加在状态消息上：正文是带预计算 markdown entity 发的，
 前置任何字符都会让 offset 整体错位）。
 
+**图片与文件**：照片和 document 都在 `_on_message` 里下下来，base64 跟着
+`{"op": "message"}` 一起过总线（hermes 那套办法，`02-sse-api.md`「附件」定义了载荷）。
+agent 侧不能自己取：`file_id` 只有拿 bot token 才兑得出来，而 token 在这边、
+也该留在这边；Pi 的出网还走着一个与 Telegram 无关的代理。
+单个上限 10MB —— 字节要过总线、还要落在 agent 的工作区，这两笔开销和模型看不看它无关。
+无 caption 的图片是一条完整的消息，所以 `text` 允许为空。
+**agent → Telegram 方向没做**：现在唯一往回送的文件是 diff（`send_document`），
+真需要时按同样形状加一个事件即可。
+
 **已知限制**：两个 thread 同时输出正文时会交错，只有状态消息能区分来源。
 forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第二步。
 
@@ -195,4 +204,4 @@ thread 被 LRU 淘汰后按钮才被点到，`POST /approve` 返回 409（`api.p
 - 队列的 `x-message-ttl` / `x-max-length` 具体取值没有依据，先按 1 小时 / 5000 条起，跑一段时间再调
 - rpi 那张 mTLS 证书对应的用户需要对 exchange `agent` 有 `configure` 权限
   （已确认可以 declare，但 `rabbitmq-definitions.age` 是加密的，实际权限位未亲眼核对）
-- 媒体（图片/文档）暂不支持。hermes 那套 base64 过总线的做法能用，但先把文本路径跑通
+- inbox 里的附件没有清理。thread 是软删的，它的附件目录会一直留着

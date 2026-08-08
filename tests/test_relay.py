@@ -229,7 +229,7 @@ async def test_message_posts_then_follows() -> None:
     await relay._dispatch({"op": "message", "thread_id": "thr_x", "text": "go", "after": 2})
     await relay._followers["thr_x"]
 
-    assert posted == [{"text": "go"}]
+    assert posted == [{"text": "go", "attachments": []}]
     assert relay.published == [
         ("thread.status", {"id": "evt_000003", "thread_id": "thr_x", "status": "idle"})
     ]
