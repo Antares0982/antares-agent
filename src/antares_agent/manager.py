@@ -29,9 +29,6 @@ from .store import Store, ThreadRow
 
 log = logging.getLogger(__name__)
 
-#: Left by the CLI when a pending approval dies with the process (V1).
-ABORT_MARKER = "Tool permission stream closed"
-
 
 class UnknownThread(KeyError):
     pass
@@ -173,23 +170,60 @@ class ThreadManager:
     def is_live(self, thread_id: str) -> bool:
         return thread_id in self._live
 
-    def report_approval_lost(self, thread_id: str) -> None:
-        """Tell the client a restart ate a pending approval (V1).
+    # -- recovery --------------------------------------------------------
 
-        `resume` does not re-issue the request, so without this the thread
-        would just sit there looking finished while the user waits for a
-        prompt that will never arrive.
+    def recover(self) -> list[str]:
+        """Write down what a crash left unfinished, before any client reads it.
+
+        A thread's status lives in its event stream, so a process that dies
+        mid-turn leaves every client holding a `busy` that is never followed by
+        an `idle`, and an `approval.required` that is never answered. Neither
+        corrects itself later: the CLI does fold the pending tool call into a
+        failure and keep the session consistent (V1), but it does not re-issue
+        the request on `resume`, and the thread stays cold until someone speaks
+        to it. So the correction is written here, at startup, while every
+        thread is still cold -- reviving one to tell it that it is idle would
+        cost a CLI process (~123MB, V4) for a thread nobody asked for.
+
+        A non-idle tail is the whole test. An unanswered approval always
+        leaves one behind, because the status only returns to `busy` once the
+        last pending approval resolves, so this never misses one.
         """
-        event_log = self._logs.get(thread_id)
-        if event_log is None:
-            return
-        event_log.publish(
-            Event(
-                type=EventType.ERROR,
-                thread_id=thread_id,
-                data={
-                    "code": "approval_lost",
-                    "message": "上次的审批请求因进程重启而失效，可以重发消息让它重试。",
-                },
+        recovered: list[str] = []
+        for row in self.store.list_threads(limit=10_000):
+            status = self.store.last_status(row.thread_id)
+            if status is None or status == str(ThreadStatus.IDLE):
+                continue
+
+            lost = self.store.unanswered_approvals(row.thread_id)
+            if lost:
+                self._record(
+                    row.thread_id,
+                    EventType.ERROR,
+                    {
+                        "code": "approval_lost",
+                        # Named so the client can retire exactly the buttons
+                        # that died, instead of guessing or leaving them live.
+                        "approval_ids": lost,
+                        "message": "上次的审批请求因进程重启而失效，可以重发消息让它重试。",
+                    },
+                )
+            self._record(
+                row.thread_id,
+                EventType.THREAD_STATUS,
+                {"status": str(ThreadStatus.IDLE), "background_agents": 0},
             )
-        )
+            recovered.append(row.thread_id)
+            log.info("recovered thread %s from %s (%d lost approvals)", row.thread_id,
+                     status, len(lost))
+        return recovered
+
+    def _record(self, thread_id: str, type_: EventType, data: dict) -> None:
+        """Append straight to the store, outside any EventLog.
+
+        Nothing is subscribed at this point and nothing should be started to
+        make it so; the id continues the thread's sequence, which is where a
+        later `EventLog` picks it up from anyway.
+        """
+        event = Event(type=type_, thread_id=thread_id, data=data)
+        self.store.append_event(event.with_id(self.store.last_event_id(thread_id) + 1))

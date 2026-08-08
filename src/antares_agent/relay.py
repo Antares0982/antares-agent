@@ -68,6 +68,11 @@ QUEUE_MAX_LEN = int(os.environ.get("QUEUE_MAX_LEN", 5000))
 THREAD_BOUND = "relay.thread_bound"
 THREAD_LIST = "relay.thread_list"
 CMD_FAILED = "relay.cmd_failed"
+#: Announced once per start. The relay is bound to the agent's lifetime, so
+#: this is also the agent's "I restarted" -- which the bot cannot otherwise
+#: notice, and needs to, because a restart is exactly when the agent has
+#: something new to say about threads nobody is currently following.
+ONLINE = "relay.online"
 
 _TIMEOUT = httpx.Timeout(30.0, read=None)
 
@@ -107,6 +112,9 @@ class Relay:
                 "relay up: exchange=%s queue=%s api=%s", EXCHANGE, CMD_QUEUE, self._http.base_url
             )
             await queue.consume(self._on_command)
+            # After consume, so the resume commands this provokes arrive at a
+            # relay that can already answer them.
+            await self._publish(ONLINE, {})
             await asyncio.Future()
 
     async def _publish(self, type_: str, payload: dict[str, Any]) -> None:

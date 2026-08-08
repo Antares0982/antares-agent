@@ -267,6 +267,33 @@ def test_replay_endpoint_does_not_wake_the_thread(client: TestClient) -> None:
     assert len(client.started) == before  # type: ignore[attr-defined]
 
 
+def test_startup_corrects_a_thread_a_crash_left_awaiting_approval(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End to end for the recovery pass: the correction has to be readable
+    # through `/events/replay`, which is the only endpoint the bot uses after a
+    # restart -- writing it anywhere the client does not look would be no fix.
+    store = Store(settings.db_path)
+    store.create_thread("thr_x", "quick")
+    for n, (type_, data) in enumerate(
+        [
+            (EventType.APPROVAL_REQUIRED, {"approval_id": "apr_abc", "tool": "Bash"}),
+            (EventType.THREAD_STATUS, {"status": "awaiting_approval"}),
+        ],
+        start=1,
+    ):
+        store.append_event(Event(type=type_, thread_id="thr_x", data=data).with_id(n))
+    store.close()
+
+    monkeypatch.setattr(api_mod.preflight, "run", lambda s: preflight.PreflightReport(ok=True))
+    with TestClient(api_mod.create_app(settings)) as fresh:
+        body = fresh.get("/v1/threads/thr_x/events/replay?after=2").json()
+
+    assert [e["type"] for e in body["events"]] == ["error", "thread.status"]
+    assert body["events"][0]["payload"]["approval_ids"] == ["apr_abc"]
+    assert body["events"][1]["payload"]["status"] == "idle"
+
+
 def test_event_ids_continue_across_a_restart(settings: Settings) -> None:
     store = Store(settings.db_path)
     try:

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .events import Event
+from .events import Event, EventType
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS threads (
@@ -137,6 +137,42 @@ class Store:
             (thread_id, after, limit),
         ).fetchall()
         return [{"type": r["type"], "payload": json.loads(r["payload"])} for r in rows]
+
+    def last_status(self, thread_id: str) -> str | None:
+        """The status the thread last announced, or None if it never has."""
+        row = self._db.execute(
+            "SELECT payload FROM events WHERE thread_id = ? AND type = ? "
+            "ORDER BY event_id DESC LIMIT 1",
+            (thread_id, str(EventType.THREAD_STATUS)),
+        ).fetchone()
+        return json.loads(row["payload"]).get("status") if row else None
+
+    def unanswered_approvals(self, thread_id: str) -> list[str]:
+        """Approvals that were asked and never resolved.
+
+        Read at startup this means one thing only: the process died holding
+        them. Answering the question from our own log rather than from the
+        CLI's session file keeps it inside data we write ourselves -- the
+        marker the CLI leaves behind (V1) says the same thing, but only via a
+        path convention and a file format that are nobody's published API.
+        """
+        rows = self._db.execute(
+            "SELECT type, payload FROM events WHERE thread_id = ? AND type IN (?, ?) "
+            "ORDER BY event_id",
+            (thread_id, str(EventType.APPROVAL_REQUIRED), str(EventType.APPROVAL_RESOLVED)),
+        ).fetchall()
+        # dict rather than set: the order the user was asked in is the order
+        # worth reporting back, and there are never many.
+        waiting: dict[str, None] = {}
+        for row in rows:
+            approval_id = json.loads(row["payload"]).get("approval_id")
+            if approval_id is None:
+                continue
+            if row["type"] == str(EventType.APPROVAL_REQUIRED):
+                waiting[approval_id] = None
+            else:
+                waiting.pop(approval_id, None)
+        return list(waiting)
 
     def last_event_id(self, thread_id: str) -> int:
         row = self._db.execute(

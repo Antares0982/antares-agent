@@ -15,6 +15,10 @@
 - **API 鉴权** —— 没写鉴权代码，改成监听 unix socket（`ANTARES_SOCKET`），
   授权交给 `RuntimeDirectoryMode=0750` 的目录。`actionrunner` / `ssrjsonrunner`
   那条路直接消失
+- **崩溃对账**（2026-08-08）—— `ThreadManager.recover()` 在启动时补齐进程死在 turn
+  中间留下的东西：没配上 `resolved` 的审批推 `approval_lost`，状态一律补回 `idle`。
+  判据取自自己的事件日志而非 CLI session 文件（理由见 `02-sse-api.md`）。
+  bot 侧靠 `relay.online` 主动来问 —— agent 重启时没有任何流开着，写进 sqlite 没人读
 
 ---
 
@@ -28,6 +32,8 @@
 - socket 权限链：`agent-relay` 属于 group `agent` → 能穿过 0750 的
   `/run/antares-agent` → 能连 0666 的 socket
 - D13 的节奏是否真的成立：一个 turn 结束后 relay 确实关流、thread 确实被 LRU 收掉
+- 崩溃对账：`systemctl restart` 打在挂起审批上，看 Telegram 里按钮是否被收掉、
+  是否只报一次。单测覆盖了对账本身，`relay.online` → `resume` 这一跳只在假总线上验过
 - 媒体（图片/文档）没做。hermes 那套 base64 过总线的办法能用
 - 多个 thread 同时输出正文会交错，只有状态消息带的 `⟨thr_…⟩` 前缀能区分来源。
   正解是 forum topics 的 `message_thread_id`
@@ -61,17 +67,6 @@
 同上。D8 已经在建 session 时开了 `enable_file_checkpointing=True`
 （**这个选项只能在创建时设，无法对已有 session 追加** —— 所以它是从第一天就开着的，
 不是等到写 `/undo` 才开），剩下的是 `rewind_files()` 的粒度与 `message_id` 语义。
-
-### 6. `approval_lost` 的恢复路径没接线
-
-`manager.py` 里 `ABORT_MARKER` 和 `report_approval_lost()` 都写好了，**没有任何地方调用**。
-
-V1 实测过：进程带着挂起审批死掉时，CLI 会把待批工具合成为一次工具失败写进会话，
-会话状态是一致的；但 `resume` 之后审批**不会自动重发**。所以恢复时要读末条
-`tool_result`、判断是不是 `AbortError: Tool permission stream closed`，
-据此推一条 `error/approval_lost` 事件告诉用户"发句话就能让它重试"。
-
-不接线的后果：thread 看起来正常，用户等一个永远不会来的审批。
 
 ---
 

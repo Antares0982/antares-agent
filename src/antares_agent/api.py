@@ -59,6 +59,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.store = store
         app.state.manager = ThreadManager(settings, store)
+        # Before the first request, so a client that reconnects immediately
+        # reads the correction rather than the crash's last word.
+        app.state.manager.recover()
         try:
             yield
         finally:

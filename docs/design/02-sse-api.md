@@ -199,10 +199,11 @@ thread busy 时收到新消息（D1）。
 ### `error`
 
 ```jsonc
-{ "code": "interrupted" | "internal" | "approval_timeout" | "approval_lost", "message": "..." }
+{ "code": "interrupted" | "internal" | "approval_timeout" | "approval_lost", "message": "...",
+  "approval_ids": ["apr_a1b2c3"] }
 ```
 
-`approval_lost` 表示挂起的审批因进程重启而失效（见下节）。
+`approval_lost` 表示挂起的审批因进程重启而失效（见下节），`approval_ids` 仅此码有。
 
 ## 审批时序
 
@@ -228,13 +229,27 @@ thread busy 时收到新消息（D1）。
 stream closed before response received`）并让 turn 正常收尾。会话状态一致，**无需持久化 pending
 approval**。
 
-但审批 `resume` 后不会自动重发。因此恢复流程是：
+但审批 `resume` 后不会自动重发。恢复因此是**启动时的一次对账**（`ThreadManager.recover()`），
+在接第一个请求之前跑完：
 
-1. `resume` 会话，读末条 `tool_result`
-2. 若匹配上述 `AbortError`，推 `error{code:"approval_lost"}` 并把 thread 置回 `idle`
-3. 客户端展示"上次审批因重启中断"，用户可一键重试（等价于发一句继续）
+1. 逐个 thread 读事件流末条 `thread.status`。是 `idle` 就跳过 —— 上次是干净收尾的
+2. 否则查有没有 `approval.required` 没配上 `approval.resolved`。
+   有就推 `error{code:"approval_lost"}`，`approval_ids` 带上是哪几个
+3. 无论有没有，补一条 `thread.status:idle`
 
-`approval_lost` 因此是 `error.code` 的一个取值，与 `approval_timeout` 并列。
+判据取自**我们自己写的事件日志**，不去读 CLI 的 session 文件。那份文件里的
+`AbortError: Tool permission stream closed` 说的是同一件事，但要靠一套没有公开 API 的
+路径约定加文件格式才读得到；而挂起的审批必然在我们这边留下一条没有对应 `resolved` 的
+`required`，同样确定，且是自己的数据。
+
+第 3 步不只是给审批擦屁股：进程死在 turn 中间时，客户端手里最后一条状态永远停在
+`busy`，没有任何东西会来纠正它。这条 `idle` 也让对账**幂等** —— 下次启动读到 `idle` 就跳过，
+不会把用户已经翻篇的事再报一遍。
+
+代价是要唤醒的线程数为零：对账只写 sqlite，不建 `EventLog`、不起 CLI 进程（V4：~123MB）。
+
+`approval_lost` 因此是 `error.code` 的一个取值，与 `approval_timeout` 并列，
+额外带一个 `approval_ids: [...]`，客户端据此正好收掉那几个已经按不动的按钮。
 
 ## 重连
 
