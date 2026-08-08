@@ -297,3 +297,49 @@ async def test_unknown_op_is_reported_not_swallowed() -> None:
     relay = relay_over(lambda r: httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="unknown op"):
         await relay._dispatch({"op": "teleport", "thread_id": "thr_x"})
+
+
+# --- connection parameters -----------------------------------------------
+
+
+def test_vhost_is_passed_through_but_the_default_is_left_implicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `/` is aio_pika's own default, so sending it explicitly would only be a
+    # second place for it to be wrong. Anything else has to reach the broker:
+    # the wrong vhost is an ACCESS_REFUSED that reads exactly like bad
+    # credentials.
+    from antares_agent.relay import _amqp_kwargs
+
+    monkeypatch.setenv("RMQ_VHOST", "/")
+    assert "virtualhost" not in _amqp_kwargs()
+
+    monkeypatch.setenv("RMQ_VHOST", "hermes")
+    assert _amqp_kwargs()["virtualhost"] == "hermes"
+
+
+def test_credentials_are_omitted_rather_than_sent_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from antares_agent.relay import _amqp_kwargs
+
+    monkeypatch.delenv("RMQ_USER", raising=False)
+    assert "login" not in _amqp_kwargs()
+
+    monkeypatch.setenv("RMQ_USER", "rpi")
+    monkeypatch.setenv("RMQ_PASS", "s3cret")
+    kwargs = _amqp_kwargs()
+    assert (kwargs["login"], kwargs["password"]) == ("rpi", "s3cret")
+
+
+def test_tls_needs_the_whole_certificate_triple(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # Two out of three silently downgrades to plaintext, which then hangs
+    # against a TLS listener instead of saying why.
+    from antares_agent.relay import _amqp_kwargs
+
+    monkeypatch.setenv("RMQ_CAFILE", str(tmp_path / "ca.crt"))
+    monkeypatch.setenv("RMQ_CERTFILE", str(tmp_path / "client.crt"))
+    monkeypatch.delenv("RMQ_KEYFILE", raising=False)
+    assert "ssl" not in _amqp_kwargs()

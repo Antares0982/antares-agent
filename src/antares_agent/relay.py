@@ -92,7 +92,21 @@ class Relay:
     # -- bus -------------------------------------------------------------
 
     async def run(self) -> None:
-        connection = await aio_pika.connect_robust(**_amqp_kwargs())
+        kwargs = _amqp_kwargs()
+        # Every one of these has a default that is silently wrong in
+        # production: no RMQ_USER means `guest`, which the broker refuses from
+        # off-box, and a missing vhost or a half-set certificate triple fails
+        # just as opaquely. Saying it out loud costs one line and turns an
+        # ACCESS_REFUSED into something that names its own cause.
+        log.info(
+            "connecting to amqp%s://%s@%s:%s vhost=%s",
+            "s" if kwargs.get("ssl") else "",
+            kwargs.get("login", "guest (RMQ_USER unset)"),
+            kwargs["host"],
+            kwargs["port"],
+            kwargs.get("virtualhost", "/"),
+        )
+        connection = await aio_pika.connect_robust(**kwargs)
         async with connection:
             channel = await connection.channel()
             # One in flight at a time: commands for a thread are ordered, and
