@@ -75,8 +75,15 @@ SDK 随后自动续跑并再产生 `ResultMessage`。真正的空闲条件是
 ### `text` — 模型文本输出
 
 ```jsonc
-{ "content": "我先看一下 api 的接口定义...", "delta": true }
+{ "content": "我先看一下 api 的接口定义...", "delta": false }
 ```
+
+⚠️ **`delta` 恒为 `false`**（`translate.py`）。D1 要求用 `receive_messages()` 而非
+`receive_response()`，拿到的是完整的 `AssistantMessage`，所以一个完整文本块推一条事件，
+**不是逐 token 流式**。字段保留是给将来接 partial 流用的，现在客户端可以无视它。
+
+这条对适配器是好消息：事件速率是每 turn 几十条而非每秒几百条，
+不需要为节流做特别设计（Telegram 那 1 次/秒的编辑限额才是瓶颈）。
 
 ### `tool.call`
 
