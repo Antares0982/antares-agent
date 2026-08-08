@@ -573,6 +573,43 @@ db / profiles 移到 `StateDirectory=`，`ProtectHome=tmpfs` 只放回 workspace
 F13 的结论对**这台机器**依旧成立（其 flake pin `d7a713c` 给的是 2.1.81）。
 若哪天顺带升了 rpi5 的 nixpkgs，可以重新考虑走 nixpkgs 路线免掉 nix-ld。
 
+## 上线后发现（2026-08-08，第一次真机对话）
+
+### F29 ❌ `path =` 到不了 Bash 工具 —— 登录 shell 会重写 PATH
+
+现象：每条沙箱内的 Bash 都是 `Exit code 127 / zsh:1: command not found: bwrap`，
+但服务进程自己的 PATH 里 bubblewrap 明明在（preflight 的 `shutil.which` 也找得到）。
+
+原因是 CLI 把每条命令交给**登录 shell** 执行，而 NixOS 的 `/etc/zshenv` 里有：
+
+```sh
+if [ -z "${__NIXOS_SET_ENVIRONMENT_DONE-}" ]; then
+    . /nix/store/…-set-environment      # 这一行直接覆盖 PATH
+fi
+```
+
+于是 unit 的 `path =` 只到达服务进程，**到不了它经 shell 启动的任何东西**。
+实测同一个 PATH 下 `zsh -c 'command -v bwrap'` 失败、`bash -c` 成功。
+
+这是**失败关闭**，不是 F23 的失败开放 —— 没有任何东西逃出沙箱。
+但危害是另一种：模型把 127 读成"沙箱坏了"，改用 `dangerouslyDisableSandbox: true`
+重试，于是用户被训练成对着"关掉沙箱"这件事一路点允许。第一次真机对话里就发生了 6 次。
+
+两处修：bubblewrap / socat 进 `environment.systemPackages`（系统 PATH 才是 shell
+重置后剩下的那个）；preflight 增加 `check_shell_path()`，用 `$SHELL -c 'command -v …'`
+在**真正要查的那个 PATH 上**再查一遍，查不到就拒绝启动。
+
+### `ProtectHome=tmpfs` 意味着手放进 `/home/agent` 的文件不存在
+
+同样是第一次真机对话里撞到的：用户配了 `~/.gitconfig`、导了 gpg 私钥，
+agent `ls ~` 只看到 `agent_work` / `app` / `.claude` 三项 —— 它们是仅有的三条 bind mount，
+其余部分是一个 root 拥有的空 tmpfs。这是设计意图（见上一节），
+但意味着**任何要给 agent 用的家目录文件都必须在 unit 里显式列出**，重启也不会自己出现。
+
+`.gitconfig` 以只读挂入，`.gnupg` 以可写挂入（gpg 要写 random_seed 与 agent socket）。
+`~/.gnupg` 本来就在 `DEFAULT_SECRET_PATHS` 里，所以 `git commit -S` 能签，
+`cat ~/.gnupg/…` 仍被 deny 规则拦掉 —— 这正是想要的分工。
+
 ---
 
 ## 待办

@@ -4,7 +4,7 @@
 已在 Pi 上作为 systemd 服务跑起来。以下按"不做会怎样"排序，不按工作量。
 
 设计文档见 `design/00-overview.md`（决策 D1–D9）、`design/04-telegram.md`（D10–D14）
-与 `design/03-verification.md`（实测 F1–F28）。下文凡引用 `Fnn` / `Dn` 均指这几份。
+与 `design/03-verification.md`（实测 F1–F29）。下文凡引用 `Fnn` / `Dn` 均指这几份。
 
 ---
 

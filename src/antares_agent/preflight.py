@@ -15,6 +15,7 @@ mechanism instead of the model's willingness to try.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -82,6 +83,57 @@ def check_sandbox() -> PreflightReport:
     return report
 
 
+def check_shell_path(shell: str | None = None) -> PreflightReport:
+    """The same two binaries again, looked up where they are actually looked up.
+
+    `shutil.which` above answers for *this* process. The Bash tool does not
+    run in this process: the CLI hands each command to the login shell, and a
+    login shell is free to rewrite PATH before anything else happens --
+    NixOS's `/etc/zshenv` replaces it outright with the system PATH, so a
+    `path =` in a systemd unit reaches the server and nothing it spawns
+    through a shell.
+
+    Untested, that gap costs one `command not found: bwrap` per Bash call
+    forever. It fails closed, so nothing escapes -- but the model reads the
+    127 as "the sandbox is broken", asks for `dangerouslyDisableSandbox`
+    instead, and the user gets trained to approve exactly the thing the
+    sandbox exists to prevent.
+    """
+    report = PreflightReport(ok=True)
+    shell = shell or os.environ.get("SHELL") or ""
+    if not shell:
+        report.notes.append("SHELL unset; skipping the login-shell PATH check")
+        return report
+
+    missing: list[str] = []
+    for binary in REQUIRED_BINARIES:
+        try:
+            proc = subprocess.run(
+                [shell, "-c", f"command -v {binary}"],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            report.notes.append(f"could not probe {shell}: {exc}")
+            return report
+        if proc.returncode != 0:
+            missing.append(binary)
+
+    if missing:
+        report.ok = False
+        report.problems.append(
+            f"{shell} cannot find {', '.join(missing)}, though this process can. "
+            "The Bash tool runs through the login shell, and this one rewrites PATH "
+            "(on NixOS /etc/zshenv replaces it with the system PATH), so every "
+            "sandboxed command will die with 'command not found'. Put them on the "
+            "system PATH rather than only in the unit's."
+        )
+    else:
+        report.notes.append(f"{shell} resolves the sandbox binaries")
+    return report
+
+
 def check_workspace(settings: Settings) -> PreflightReport:
     report = PreflightReport(ok=True)
     if not settings.workspace.is_dir():
@@ -101,7 +153,7 @@ def check_workspace(settings: Settings) -> PreflightReport:
 def run(settings: Settings) -> PreflightReport:
     """Raise unless the sandbox is demonstrably working."""
     combined = PreflightReport(ok=True)
-    for part in (check_workspace(settings), check_sandbox()):
+    for part in (check_workspace(settings), check_sandbox(), check_shell_path()):
         combined.ok = combined.ok and part.ok
         combined.problems += part.problems
         combined.notes += part.notes
