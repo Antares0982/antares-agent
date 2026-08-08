@@ -92,7 +92,7 @@ relay 自己产生三种信封，与 agent 事件共用 `agent.event`，用 `rel
 | `relay.thread_bound` | `new_thread` 与 `switch` **共用** —— bot 两种情况下做的事一样 |
 | `relay.thread_list` | `list` 的结果，`GET /v1/threads` 原样透传 |
 | `relay.cmd_failed` | 任何 op 抛错，带 `op` / `chat_id` / `detail` |
-| `relay.online` | relay 启动。relay 与 agent 同生共死，所以这等于「agent 重启了」 |
+| `relay.online` | relay 启动**且 agent 已经在应答**。relay 与 agent 同生共死，所以这等于「agent 重启了」 |
 
 `switch` 先 `GET /v1/threads/{id}` 再回 `thread_bound`，不直接信任 id ——
 否则打错一个字符就把 chat 绑到不存在的 thread 上，之后每条命令各失败一次，
@@ -191,6 +191,12 @@ forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第�
 thread 被 LRU 淘汰后按钮才被点到，`POST /approve` 返回 409（`api.py:153`）。
 这不是错误而是事实：那次审批随进程/淘汰一起没了。
 按钮改成一行说明，提示重发消息即可重试 —— 与 `approval_lost` 的处置一致。
+
+`relay.online` 发出之前 relay 会先等 `GET /v1/health` 通 —— unit 里的 `after=` 与
+`bindsTo=` 只保证 agent 进程被 exec 了，不保证 uvicorn 已经 bind 上 socket
+（实测差约 1 秒）。早发一秒的代价是 bot 立刻回一批 `resume`，全部撞在不存在的
+socket 上变成 `[Errno 2]` —— 一次正常重启在聊天里刷出四条红字。命令队列是 durable 的，
+等待只花延迟。
 
 **agent 重启**：收到 `relay.online` 就对全部已知 thread 发一遍 `resume`。
 必须由 bot 主动问，因为重启后没有任何一条流是开着的 —— agent 的对账

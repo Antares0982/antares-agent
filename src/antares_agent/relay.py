@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import ssl
+import time
 from typing import Any
 
 import aio_pika
@@ -73,6 +74,12 @@ CMD_FAILED = "relay.cmd_failed"
 #: notice, and needs to, because a restart is exactly when the agent has
 #: something new to say about threads nobody is currently following.
 ONLINE = "relay.online"
+
+#: How long to wait for the agent's socket before giving up and letting
+#: systemd restart us. The unit orders this process after the agent's, but
+#: `Type=exec` promises only that it was exec'd -- uvicorn binds the socket
+#: about a second later, and preflight runs before that.
+API_WAIT_S = 60.0
 
 _TIMEOUT = httpx.Timeout(30.0, read=None)
 
@@ -125,11 +132,33 @@ class Relay:
             log.info(
                 "relay up: exchange=%s queue=%s api=%s", EXCHANGE, CMD_QUEUE, self._http.base_url
             )
+            # Before consuming, not after: the bot answers `relay.online` with
+            # a `resume` per thread it knows about, and a socket that is not
+            # there yet turns every one of them into a red message in the
+            # chat -- for a restart that is going perfectly well. The queue is
+            # durable, so waiting here costs latency and nothing else.
+            await self._await_api()
             await queue.consume(self._on_command)
             # After consume, so the resume commands this provokes arrive at a
             # relay that can already answer them.
             await self._publish(ONLINE, {})
             await asyncio.Future()
+
+    async def _await_api(self) -> None:
+        """Block until the agent answers, so `online` means what it says."""
+        deadline = time.monotonic() + API_WAIT_S
+        announced = False
+        while True:
+            try:
+                await self._http.get("/v1/health")
+                return
+            except httpx.HTTPError as exc:
+                if time.monotonic() >= deadline:
+                    raise
+                if not announced:
+                    log.info("waiting for the agent API at %s (%s)", self._http.base_url, exc)
+                    announced = True
+                await asyncio.sleep(0.5)
 
     async def _publish(self, type_: str, payload: dict[str, Any]) -> None:
         if self._exchange is None:

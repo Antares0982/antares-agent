@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 import httpx
 import pytest
 
+from antares_agent import relay as relay_mod
 from antares_agent.relay import Relay, RelayError
 
 
@@ -38,6 +40,44 @@ class FakeRelay(Relay):
 def relay_over(handler: Any) -> FakeRelay:
     transport = httpx.MockTransport(handler)
     return FakeRelay(httpx.AsyncClient(transport=transport, base_url="http://agent"))
+
+
+# --- startup -------------------------------------------------------------
+
+
+async def test_online_waits_for_the_agent_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Measured on the Pi: the relay's broker connection was up a second
+    # before uvicorn bound the socket, and the bot's four `resume` commands
+    # all came back as ConnectError.
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("[Errno 2] No such file or directory")
+        return httpx.Response(200, json={"status": "ok"})
+
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    await relay_over(handler)._await_api()
+    assert len(attempts) == 3
+
+
+async def test_waiting_for_the_agent_gives_up_eventually(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Rather than blocking forever: systemd restarts us, and a process that
+    # never reports its own failure is one nobody can see is stuck.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno 2] No such file or directory")
+
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    monkeypatch.setattr(relay_mod, "API_WAIT_S", 0.0)
+    with pytest.raises(httpx.ConnectError):
+        await relay_over(handler)._await_api()
+
+
+async def _no_wait(_seconds: float) -> None:
+    return None
 
 
 # --- following -----------------------------------------------------------
