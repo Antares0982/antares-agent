@@ -60,6 +60,11 @@ HARD_DENY: tuple[str, ...] = (
     "Bash(dd:*)",
     "Bash(shutdown:*)",
     "Bash(reboot:*)",
+    # The path deny on ~/.config/gh cannot see this one: it prints the token
+    # rather than reading the file, and from there it is in the transcript,
+    # the model's context and whatever chat is following the thread. Using
+    # `gh` needs the token; printing it never does.
+    "Bash(gh auth token:*)",
 )
 
 #: Destructive but sometimes right. Escalated to the user rather than refused.
