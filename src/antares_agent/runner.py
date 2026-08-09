@@ -59,6 +59,11 @@ class ThreadState:
     queue: deque[str] = field(default_factory=deque)
     session_id: str | None = None
     summary: str = ""
+    #: Live value; the profile supplies only the initial one (D7). Deliberately
+    #: not persisted -- `start()` rebuilds the client from the profile, so a
+    #: `bypassPermissions` from one session must not follow the thread into the
+    #: next one.
+    permission_mode: str = ""
 
 
 class ThreadRunner:
@@ -86,6 +91,10 @@ class ThreadRunner:
     # -- lifecycle -------------------------------------------------------
 
     async def start(self, resume: str | None = None) -> None:
+        # The hot mode belongs to the client, and this builds a new one from
+        # the profile. The reported value has to follow it back, or the thread
+        # would keep claiming a bypass that is no longer in effect.
+        self.state.permission_mode = self.state.profile.permission_mode
         self._client = self._new_client(options=self._options(resume))
         await self._client.connect()
         self._pump = asyncio.create_task(self._read_forever(), name=f"pump-{self.thread_id}")
@@ -143,10 +152,19 @@ class ThreadRunner:
         )
 
     async def set_permission_mode(self, mode: str) -> None:
-        """Hot, unlike the profile: this never enters a model request (D7)."""
+        """Hot, unlike the profile: this never enters a model request (D7).
+
+        The switch is logged because `auto`, `dontAsk` and `bypassPermissions`
+        stop the CLI from calling `can_use_tool` at all -- and every tier past
+        the deny rules lives in there, including tier 3 and the Bash
+        credential-path check in `classify`. F30: without this the event log
+        shows approvals simply ceasing, with nothing recording why.
+        """
         if self._client is None:
             return
         await self._client.set_permission_mode(mode)  # type: ignore[arg-type]
+        self.state.permission_mode = mode
+        self._set_status(self.state.status)
 
     def resolve_approval(self, approval_id: str, allow: bool, message: str = "") -> None:
         self.approvals.resolve(approval_id, allow, message)
@@ -236,6 +254,10 @@ class ThreadRunner:
                 data={
                     "status": str(status),
                     "background_agents": len(self.translator.background_tasks),
+                    # On every status event, not only on a switch: this is the
+                    # field that answers "was the arbiter on at time T", and it
+                    # can only answer that if it is present throughout.
+                    "permission_mode": self.state.permission_mode,
                 },
             )
         )

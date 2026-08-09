@@ -652,7 +652,17 @@ bwrap: Can't mount proc on /newroot/proc: Operation not permitted
 `runner.py:145` 既不发事件也不写回 `state.profile.permission_mode`。
 
 也就是说：**"谁在什么时候关掉了审批"在事件日志里无法回答**，
-而这恰好是最需要能回答的一件事。修法是一行 —— 切换时发一条事件并落到状态里。
+而这恰好是最需要能回答的一件事。
+
+事后确认原因就是用户开了 `/mode auto`。这不改变结论：`auto` / `dontAsk` /
+`bypassPermissions` 让 CLI 不再调用 `can_use_tool`，而三层判定全长在那个回调里 ——
+`disallowed_tools`（HARD_DENY 与凭据路径的文件工具规则）由 CLI 自己评，还在；
+tier 3 与 `classify()` 里的 **Bash 凭据路径检查**（F27 说明 deny 规则盖不全所有写法，
+这层就是补那个洞的）一起没了。当时沙箱又是坏的，于是那 17 条命令毫无约束。
+
+已修：`thread.status` 每条带上 `permission_mode`，`POST /mode` 额外补发一条。
+热切仍不落盘 —— `start()` 按 profile 重建 client，让 `bypassPermissions`
+跟着 thread 活过重启是更糟的默认。
 
 ### 其它（同一次会话）
 

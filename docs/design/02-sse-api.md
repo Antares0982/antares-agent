@@ -88,7 +88,11 @@ data: { ... }
 ### `thread.status`
 
 ```jsonc
-{ "status": "idle" | "busy" | "awaiting_approval", "background_agents": 2 }
+{
+  "status": "idle" | "busy" | "awaiting_approval",
+  "background_agents": 2,
+  "permission_mode": "acceptEdits"
+}
 ```
 
 ⚠️ **`idle` 的判据不是收到 `ResultMessage`**（实测 F25）。后台 subagent 会活过 turn，
@@ -97,6 +101,13 @@ SDK 随后自动续跑并再产生 `ResultMessage`。真正的空闲条件是
 
 `background_agents` 是当前仍在跑的后台 agent 数，直接取自 `background_tasks_changed.tasks`，
 客户端可据此显示"还有 2 个调研在跑"，避免用户以为任务已经结束。
+
+`permission_mode` 每条都带，且 `POST /mode` 会额外补发一条。
+`auto` / `dontAsk` / `bypassPermissions` 下 CLI **不再调用 `can_use_tool`** ——
+tier 3 与 `classify()` 里的 Bash 凭据路径检查随之一起消失，只剩 `disallowed_tools`
+那一层。也就是说这个字段是"当时仲裁器开着没有"的唯一记录，F30 就是漏了它才
+在日志里只看到审批凭空停止。热切不落盘：`start()` 按 profile 重建 client，
+重启后回到 profile 的值，字段也跟着回去。
 
 ### `text` — 模型文本输出
 

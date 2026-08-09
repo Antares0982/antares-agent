@@ -324,3 +324,38 @@ async def test_options_respect_the_measured_constraints(tmp_path: Path) -> None:
         assert opts.cwd == str(tmp_path)
     finally:
         await r.close()
+
+
+# --- permission mode -----------------------------------------------------
+
+
+async def test_a_mode_switch_is_in_the_event_log(tmp_path: Path) -> None:
+    """F30: `auto` and friends stop the CLI calling `can_use_tool` at all, so
+    approvals just cease. The log has to say who turned them off and when."""
+    r, _ = await make(tmp_path)
+    try:
+        assert r.state.permission_mode == "acceptEdits"  # the profile's
+        before = [e for e in r.log.since(0) if e.type == EventType.THREAD_STATUS]
+
+        await r.set_permission_mode("auto")
+
+        after = [e for e in r.log.since(0) if e.type == EventType.THREAD_STATUS]
+        assert len(after) == len(before) + 1
+        assert after[-1].data["permission_mode"] == "auto"
+        assert after[-1].data["status"] == str(ThreadStatus.IDLE)  # unchanged
+    finally:
+        await r.close()
+
+
+async def test_a_bypass_does_not_survive_a_restart(tmp_path: Path) -> None:
+    """`start()` rebuilds the client from the profile, so the mode reverts --
+    and the reported value must revert with it rather than keep claiming it."""
+    r, _ = await make(tmp_path)
+    try:
+        await r.set_permission_mode("bypassPermissions")
+        assert r.state.permission_mode == "bypassPermissions"
+
+        await r.start(resume="s1")
+        assert r.state.permission_mode == "acceptEdits"
+    finally:
+        await r.close()
