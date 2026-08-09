@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    ProcessError,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -47,9 +48,15 @@ class FakeClient:
     def emit(self, message: Any) -> None:
         self._inbox.put_nowait(message)
 
+    def fail(self, exc: BaseException) -> None:
+        self._inbox.put_nowait(exc)
+
     async def receive_messages(self):
         while True:
-            yield await self._inbox.get()
+            message = await self._inbox.get()
+            if isinstance(message, BaseException):
+                raise message
+            yield message
 
 
 def result(session_id: str = "s1") -> ResultMessage:
@@ -357,5 +364,34 @@ async def test_a_bypass_does_not_survive_a_restart(tmp_path: Path) -> None:
 
         await r.start(resume="s1")
         assert r.state.permission_mode == "acceptEdits"
+    finally:
+        await r.close()
+
+
+async def test_a_sigtermed_cli_is_not_reported_as_an_internal_error(
+    tmp_path: Path,
+) -> None:
+    """A `systemctl restart` kills the whole control group, so the CLI child
+    often dies before close() cancels the pump. That is a restart, not a
+    fault, and the chat must not learn to ignore red lines."""
+    r, client = await make(tmp_path)
+    try:
+        client.fail(ProcessError("Command failed", exit_code=143))
+        await settle()
+
+        assert [e for e in r.log.since(0) if e.type == EventType.ERROR] == []
+        assert r.state.status is ThreadStatus.IDLE
+    finally:
+        await r.close()
+
+
+async def test_a_real_crash_still_reaches_the_user(tmp_path: Path) -> None:
+    r, client = await make(tmp_path)
+    try:
+        client.fail(ProcessError("Command failed", exit_code=1))
+        await settle()
+
+        errors = [e for e in r.log.since(0) if e.type == EventType.ERROR]
+        assert [e.data["code"] for e in errors] == ["internal"]
     finally:
         await r.close()

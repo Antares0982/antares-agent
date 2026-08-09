@@ -664,6 +664,18 @@ tier 3 与 `classify()` 里的 **Bash 凭据路径检查**（F27 说明 deny 规
 热切仍不落盘 —— `start()` 按 profile 重建 client，让 `bypassPermissions`
 跟着 thread 活过重启是更糟的默认。
 
+### 正常重启不该在聊天里变红
+
+两处，同一个毛病：
+
+- `exit code 143` —— systemd 默认 `KillMode=control-group`，`systemctl restart`
+  同一瞬间signal 掉本进程和所有 `claude` 子进程。子进程通常先死，消息循环因此
+  在 `close()` 取消它之前先看到 `ProcessError(143)`，于是每个活着的 thread 发一条
+  `error: internal`。已按 `exit_code == 143` 判为关机路径：转 idle，不发事件。
+- 之前那四条 `[Errno 2]` resume 失败是同一件事的另一半（relay 早发 `online`）。
+
+代价不是难看，是**聊天学会了忽略红色**——而红色是唯一该被当真的通道。
+
 ### 其它（同一次会话）
 
 - **`Grep` 工具在会话里不存在**：`No such tool available: Grep`，CLI 自己给的提示是

@@ -38,6 +38,14 @@ from .translate import Translator
 
 log = logging.getLogger(__name__)
 
+#: 128 + SIGTERM, the shell convention the CLI reports its child's death with.
+_SIGTERM_EXIT = 143
+
+
+def _is_shutdown(exc: BaseException) -> bool:
+    """Did the CLI die because someone asked it to, rather than break?"""
+    return getattr(exc, "exit_code", None) == _SIGTERM_EXIT
+
 #: Grace period after a ResultMessage before believing the thread is idle.
 #: `background_tasks_changed` can trail the ResultMessage it belongs to, and a
 #: spurious `idle` makes the client hide its progress indicator and start
@@ -191,6 +199,18 @@ class ThreadRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if _is_shutdown(exc):
+                # systemd's default KillMode is control-group, so a `systemctl
+                # restart` signals the CLI children and this process at the
+                # same instant. The child usually loses that race, and the loop
+                # sees its death before `close()` gets to cancel it. Reporting
+                # a routine restart to the user as a red internal error is the
+                # same mistake as the four `[Errno 2]` resume failures: the
+                # chat learns to ignore the one channel that should mean
+                # something.
+                log.info("thread %s: CLI terminated on shutdown", self.thread_id)
+                self._set_status(ThreadStatus.IDLE)
+                return
             log.exception("thread %s message loop failed", self.thread_id)
             self.log.publish(
                 Event(type=EventType.ERROR, thread_id=self.thread_id,
