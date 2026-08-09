@@ -184,6 +184,11 @@ forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第�
 显示当前工具与在跑的 subagent 数（`thread.status.background_agents`）。
 `message_id` 在本地，编辑零往返 —— 这正是 D11 换来的。
 
+状态消息一轮里不止一条：正文 flush 会把当前这条封口（⏳ 换成 ✔️），
+下一次 `tool.call` 另起一条。一条编辑到底的话，模型说完话之后的每一步
+都被塞回它上面，读起来像是从没走出第一个工具。收尾的 `✅ 完成 · N 次工具调用`
+因此可能是新发的一条而不是编辑 —— 回答之后正是它该在的位置。
+
 **审批**：`callback_data = "ag:<thread_id>:<approval_id>:a|d"`，
 约 32 字节，在 64 上限之内，不需要查表。
 `approval_id` 做成 `apr_` + 6 位十六进制就是为了这一刻。
