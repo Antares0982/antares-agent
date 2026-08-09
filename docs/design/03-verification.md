@@ -610,6 +610,59 @@ agent `ls ~` 只看到 `agent_work` / `app` / `.claude` 三项 —— 它们是�
 `~/.gnupg` 本来就在 `DEFAULT_SECRET_PATHS` 里，所以 `git commit -S` 能签，
 `cat ~/.gnupg/…` 仍被 deny 规则拦掉 —— 这正是想要的分工。
 
+### F30 ❌ `ProtectKernelTunables=yes` 让沙箱一次都没建起来过
+
+F29 修好之后 `bwrap` 能跑了，于是露出了下一层：
+
+```
+bwrap: Can't mount proc on /newroot/proc: Operation not permitted
+```
+
+`ProtectKernelTunables=yes` 会把 `/proc/sys`、`/proc/irq` 等以只读 bind mount
+盖上去。内核的 `mount_too_revealing()` 因此认为 `/proc` 不再"完全可见"，
+于是**拒绝非特权用户命名空间挂载新的 procfs**。在 rpi5 上逐项二分实测：
+
+| 设置 | bwrap `--unshare-all --proc /proc` |
+|---|---|
+| 全套 unit 配置 | ❌ EPERM |
+| 只去掉 `ProtectKernelTunables` | ✅ |
+| 单独加 `ProtectKernelTunables` | ❌ EPERM |
+| `ProtectControlGroups` / `ProtectSystem=strict` / `ProtectHome=tmpfs` / `PrivateTmp` / `RestrictNamespaces` / `MemoryDenyWriteExecute` 单独加 | ✅ |
+
+代价换算是单向的：服务 uid 非特权且 `NoNewPrivileges=yes`，
+不带这个设置也写不了内核旋钮（实测 `echo 1 > /proc/sys/kernel/sysrq` → EPERM）。
+留着它换来的是**整个 tier 2 不存在**。已从 unit 移除。
+
+**preflight 为什么没拦住**：`check_sandbox()` 的探针是
+`bwrap --unshare-all --ro-bind / / true` —— 没有 `--proc /proc`，
+而挂 procfs 正是真实沙箱里唯一失败的那一步。探针于是在一台每条沙箱命令都必死的
+机器上一路绿灯。已补 `--proc /proc`，并把 /proc 被遮挡写进报错文案。
+
+**代价**（铁轨小游戏那次会话，`thr_4dbd33ecf999`，47 分钟）：
+35 次 Bash 里 32 次带 `dangerouslyDisableSandbox`，占 91%。
+模型在第 2 次 127 之后就再没试过沙箱路径。前 15 次逐条弹审批、用户全部 allow，
+中位数 3 秒 —— 与 F29 记的是同一个训练过程，只是这次跑满了一整个任务。
+
+### 审批被关掉这件事在事件日志里查不到
+
+同一次会话里，20:03 之后 17 次 `dangerouslyDisableSandbox` 调用**一条
+`approval.required` 都没有**（之前 15 次每次都有，且都在几秒内 allow）。
+超时路径不是解释：`approvals.ask` 超时是拒绝并发 `approval_timeout`，日志里没有。
+剩下的可能是 `set_permission_mode("bypassPermissions")` —— 而
+`runner.py:145` 既不发事件也不写回 `state.profile.permission_mode`。
+
+也就是说：**"谁在什么时候关掉了审批"在事件日志里无法回答**，
+而这恰好是最需要能回答的一件事。修法是一行 —— 切换时发一条事件并落到状态里。
+
+### 其它（同一次会话）
+
+- **`Grep` 工具在会话里不存在**：`No such tool available: Grep`，CLI 自己给的提示是
+  改用 Bash 里的 `grep`。模型立刻照做，没有实际损失。原因未定
+  （该会话走网关跑的是 `deepseek-v4-pro`，`tool_use_id` 是 `call_00_…` 而非 `toolu_…`），
+  要定位就用嗅探器抓一次请求看 `tools` 数组。
+- **求解器退出码 1 被记成工具失败**：8 次 "NO SOLUTION FOUND" 都带 `is_error`。
+  这是程序自己的退出码，不是基础设施问题，但会让模型把正常结论读成故障。
+
 ---
 
 ## 待办

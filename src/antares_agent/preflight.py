@@ -58,9 +58,18 @@ def check_sandbox() -> PreflightReport:
     # Namespace creation is what systemd hardening most often breaks:
     # `RestrictNamespaces=user` means *only* user, and @system-service omits
     # mount/pivot_root (see 00-overview.md).
+    #
+    # `--proc /proc` is not decoration. It is the step that actually fails, and
+    # it fails for a reason nothing else here would catch: any option that
+    # over-mounts part of /proc -- `ProtectKernelTunables=yes` binds /proc/sys
+    # read-only -- makes /proc no longer "fully visible", and the kernel then
+    # refuses to let an unprivileged user namespace mount a fresh procfs at
+    # all. Probing without it passes on a host where every real sandboxed
+    # command dies (F30).
     try:
         proc = subprocess.run(
-            ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--die-with-parent", "true"],
+            ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--proc", "/proc",
+             "--die-with-parent", "true"],
             capture_output=True,
             timeout=15,
             check=False,
@@ -74,9 +83,11 @@ def check_sandbox() -> PreflightReport:
         report.ok = False
         stderr = proc.stderr.decode(errors="replace").strip().splitlines()
         report.problems.append(
-            "bwrap could not create namespaces (exit "
+            "bwrap could not build a sandbox (exit "
             f"{proc.returncode}): {stderr[-1] if stderr else 'no output'}. "
-            "Check RestrictNamespaces= lists every namespace and SystemCallFilter= includes @mount."
+            "Check RestrictNamespaces= lists every namespace, SystemCallFilter= "
+            "includes @mount, and -- if the message names /proc -- that nothing "
+            "over-mounts part of /proc (ProtectKernelTunables=yes does)."
         )
     else:
         report.notes.append("bwrap namespace probe: ok")
