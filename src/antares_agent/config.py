@@ -64,6 +64,13 @@ class Settings:
     gateway_base_url: str | None = None
     gateway_auth_token: str | None = None
 
+    #: Alias tier -> concrete model id, for endpoints that never heard of
+    #: Anthropic's names. `profile.model` only covers the main model; the CLI
+    #: resolves the `opus`/`sonnet`/`haiku` aliases itself for subagents and for
+    #: its own background haiku calls, and those requests go out unmapped.
+    #: Keys are the tier names as the CLI spells them (`OPUS`/`SONNET`/`HAIKU`).
+    model_aliases: dict[str, str] = field(default_factory=dict)
+
     host: str = "127.0.0.1"
     port: int = 60001
 
@@ -110,11 +117,13 @@ class Settings:
         if not token and token_file:
             token = token_file.read_text().strip()
         extra_deny = _env("EXTRA_DENY") or ""
+        aliases = {tier: _env(f"MODEL_{tier}") for tier in ("OPUS", "SONNET", "HAIKU")}
         return cls(
             workspace=workspace,
             cli_path=_env_path("CLI_PATH"),
             gateway_base_url=_env("GATEWAY_URL"),
             gateway_auth_token=token,
+            model_aliases={t: m for t, m in aliases.items() if m},
             host=_env("HOST", "127.0.0.1") or "127.0.0.1",
             port=_env_int("PORT", 60001),
             socket_path=_env_path("SOCKET"),

@@ -400,6 +400,37 @@ async def test_options_respect_the_measured_constraints(tmp_path: Path) -> None:
         await r.close()
 
 
+async def test_model_aliases_reach_the_cli_as_env(tmp_path: Path) -> None:
+    """A subagent asks for its tier by alias, so mapping only `profile.model`
+    would send `sonnet` to an endpoint that has never heard of it."""
+    settings = Settings(
+        workspace=tmp_path,
+        model_aliases={"OPUS": "deepseek-v4-pro", "HAIKU": "deepseek-v4-flash"},
+    )
+    clients: list[FakeClient] = []
+
+    def factory(*, options: Any) -> FakeClient:
+        clients.append(FakeClient(options=options))
+        return clients[-1]
+
+    r = ThreadRunner(
+        thread_id="thr_2",
+        settings=settings,
+        manifest=empty_manifest(tmp_path),
+        profile=Profile(name="deep", model="opus"),
+        client_factory=factory,
+    )
+    await r.start()
+    try:
+        env = clients[0].options.env
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "deepseek-v4-pro"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "deepseek-v4-flash"
+        assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in env  # unset stays unset
+        assert clients[0].options.model == "opus"  # resolved by the same map
+    finally:
+        await r.close()
+
+
 # --- permission mode -----------------------------------------------------
 
 

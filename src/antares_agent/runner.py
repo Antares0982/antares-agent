@@ -383,6 +383,11 @@ class ThreadRunner:
         if self.settings.gateway_auth_token:
             env["ANTHROPIC_AUTH_TOKEN"] = self.settings.gateway_auth_token
             env["ANTHROPIC_API_KEY"] = self.settings.gateway_auth_token
+        # Subagents and the CLI's own background calls pick a tier alias, not
+        # `profile.model`, so the mapping has to live where the CLI resolves
+        # aliases -- otherwise Explore asks a DeepSeek endpoint for `sonnet`.
+        for tier, model in self.settings.model_aliases.items():
+            env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = model
 
         return ClaudeAgentOptions(
             cwd=str(self.settings.workspace),

@@ -52,12 +52,18 @@ _BUILTIN: dict[str, dict[str, Any]] = {
     "quick": {
         "description": "日常小改动。不扇出，直接改。",
         "permission_mode": "acceptEdits",
+        # Tier alias, not a provider model id: ANTARES_MODEL_* maps it at the
+        # CLI, so a profile stays valid whichever endpoint is behind it.
+        "model": "sonnet",
         "effort": "low",
         "append": "",
     },
     "deep": {
         "description": "跨仓库任务。先出计划，再动手。",
         "permission_mode": "plan",
+        # F26: flash barely fans out on its own, so orchestration needs the
+        # top tier.
+        "model": "opus",
         "effort": "high",
         "append": ORCHESTRATION,
     },
@@ -87,6 +93,7 @@ def materialise(settings: Settings) -> None:
         lines = [
             f'description = "{spec["description"]}"',
             f'permission_mode = "{spec["permission_mode"]}"',
+            f'model = "{spec["model"]}"',
             f'effort = "{spec["effort"]}"',
         ]
         if spec["append"]:
@@ -139,5 +146,6 @@ def _from_spec(name: str, spec: dict[str, Any]) -> Profile:
         description=spec["description"],
         append=spec["append"],
         permission_mode=spec["permission_mode"],
+        model=spec["model"],
         effort=spec["effort"],
     )
