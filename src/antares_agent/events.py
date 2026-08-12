@@ -30,6 +30,7 @@ class EventType(StrEnum):
     APPROVAL_REQUIRED = "approval.required"
     APPROVAL_RESOLVED = "approval.resolved"
     DIFF = "diff"
+    FILE = "file"
     QUEUED = "queued"
     TURN_DONE = "turn.done"
     ERROR = "error"
@@ -158,5 +159,8 @@ class AgentRegistry:
             return known
         # An event arrived before (or without) its spawn -- still give the
         # client a groupable identity rather than folding it into root.
-        return AgentRef(id=f"agt_{parent_tool_use_id[-6:]}", name="subagent",
-                        parent_tool_use_id=parent_tool_use_id)
+        return AgentRef(
+            id=f"agt_{parent_tool_use_id[-6:]}",
+            name="subagent",
+            parent_tool_use_id=parent_tool_use_id,
+        )

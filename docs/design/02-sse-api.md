@@ -209,6 +209,28 @@ per-repo agent。仓库归属靠 `repo_hint`：服务端拿 task 文本去匹配
 
 **这是有意不依赖 `Edit` 工具事件的**：`sed -i`、`python fix.py`、`git apply` 造成的改动同样会被捕获。工具事件用于实时感知，`diff` 事件用于事实核对。
 
+### `file` — agent 发给用户的文件
+
+```jsonc
+{
+  "name": "report.md",
+  "mime": "text/markdown",
+  "size": 5120,
+  "data_b64": "..."                // 超过 10MB 时没有这个字段，改为 reason: "too_large"
+}
+```
+
+与附件反向对称：模型把要发出的文件复制到 `<workspace>/<scratch>/outbox/<thread_id>/`
+（路径写在该 thread 的 system prompt 里 —— 模型没有别的途径知道自己的 thread id），
+`ResultMessage` 时与 `diff` 一并扫描、推送、然后把文件移出该目录。
+
+**「离开目录」就是「已发送」的账本**，不另建一张表：另一份状态只会需要和文件系统对账，
+而文件系统已经能表达这件事。发布在前、删除在后，所以中途崩溃的代价是重复一份而不是丢一份。
+
+由此得到两条性质：**进程重启不会重放整个目录**（只有 turn 结束会扫描，而一轮结束后目录是空的），
+以及 **turn 崩在写完文件之后**时，这些文件会在该 thread 下一轮结束时补发 —— 它们从未发出过。
+超限的文件同样被移走：留在原地就是此后每一轮重试一次，永远。
+
 ### `queued`
 
 ```jsonc
@@ -326,5 +348,7 @@ Telegram 参考实现的建议，不属于本接口的约定：
 | `agent.done` | edit 成 `✅ repo-api`，另发结果 |
 | `approval.required` | inline keyboard，`callback_data` 带 `approval_id` |
 | `diff` | 按仓库分别发；超长走 `sendDocument` |
+| `file` | `sendPhoto`（jpeg/png/webp）或 `sendDocument`；`too_large` 只发一行提示 |
+| `thread.status` != `idle` | 持续 `sendChatAction(typing)`，按 chat 计数 |
 
 注意 Telegram 的 `editMessageText` 约每聊天 1 次/秒，多 agent 并发时状态更新要合并成定时刷新，不能每事件一次 edit。forum 模式群组的 topics（`message_thread_id`）可直接对应 agent 树，是更省事的选择。

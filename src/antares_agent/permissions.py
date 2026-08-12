@@ -209,9 +209,7 @@ def _write_target(value: str, settings: Settings) -> Decision | None:
     forms = _normalisations(value, settings.workspace)
     for form in forms:
         if form.name in _SETTINGS_NAMES and form.parent.name == ".claude":
-            return Decision(
-                Tier.DENY, "不允许改写 .claude 设置文件（allow 规则会绕过审批）"
-            )
+            return Decision(Tier.DENY, "不允许改写 .claude 设置文件（allow 规则会绕过审批）")
 
     roots = [Path(os.path.normpath(str(settings.workspace)))]
     with suppress(OSError, RuntimeError):
@@ -329,6 +327,5 @@ def sandbox_settings() -> SandboxSettings:
         autoAllowBashIfSandboxed=True,
         # The model may still ask to escape; that request goes to tier 3.
         allowUnsandboxedCommands=True,
-        network={"allowUnixSockets": [], "allowAllUnixSockets": False,
-                 "allowLocalBinding": False},
+        network={"allowUnixSockets": [], "allowAllUnixSockets": False, "allowLocalBinding": False},
     )

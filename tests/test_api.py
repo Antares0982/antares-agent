@@ -211,9 +211,7 @@ def test_a_caption_is_optional(client: TestClient) -> None:
     assert client.started[-1].sent[0].startswith("[用户发来图片")  # type: ignore[attr-defined]
 
 
-def test_the_senders_name_cannot_choose_the_path(
-    client: TestClient, settings: Settings
-) -> None:
+def test_the_senders_name_cannot_choose_the_path(client: TestClient, settings: Settings) -> None:
     thread_id = new_thread(client)
     client.post(
         f"/v1/threads/{thread_id}/messages",

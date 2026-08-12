@@ -274,12 +274,14 @@ Pi 总内存 8GB，实测可用约 4.1GB（其余被既有服务占用）。若�
 配置（`ClaudeAgentOptions`）：
 
 ```python
-model="deepseek-v4-flash",
-env={
-    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-    "ANTHROPIC_AUTH_TOKEN": KEY,
-    "ANTHROPIC_API_KEY": KEY,
-},
+model = ("deepseek-v4-flash",)
+env = (
+    {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": KEY,
+        "ANTHROPIC_API_KEY": KEY,
+    },
+)
 ```
 
 ### F14 ✅ 主要能力全部可用

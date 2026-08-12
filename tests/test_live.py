@@ -55,7 +55,12 @@ def workspace(tmp_path: Path) -> Path:
     (repo / "notes.md").write_text("# Notes\n\nnothing yet\n", encoding="utf-8")
     # gpgsign off: a global signing config would want a tty we do not have.
     identity = [
-        "-c", "user.email=t@e.st", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+        "-c",
+        "user.email=t@e.st",
+        "-c",
+        "user.name=t",
+        "-c",
+        "commit.gpgsign=false",
     ]
     for args in (["init", "-q"], [*identity, "add", "."], [*identity, "commit", "-qm", "init"]):
         subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
@@ -86,7 +91,10 @@ def client(
     """
     for name in list(os.environ):
         if name.startswith("CLAUDE_CODE") or name in {
-            "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT",
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "CLAUDE_EFFORT",
+            "AI_AGENT",
         }:
             monkeypatch.delenv(name, raising=False)
 
@@ -101,9 +109,7 @@ def client(
     )
     app = create_app(settings)
     port = _free_port()
-    server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    )
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
 
@@ -189,8 +195,9 @@ def test_sandboxed_reads_are_silent_but_still_reported(client: httpx.Client) -> 
     )
     frames = drain(client, thread_id, until="idle")
 
-    bash = [f["payload"] for f in frames
-            if f["type"] == "tool.call" and f["payload"]["tool"] == "Bash"]
+    bash = [
+        f["payload"] for f in frames if f["type"] == "tool.call" and f["payload"]["tool"] == "Bash"
+    ]
     assert bash, [f["type"] for f in frames]
     assert bash[0]["sandboxed"] is True
     assert bash[0]["render"] == "summary"

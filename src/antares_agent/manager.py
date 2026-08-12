@@ -178,9 +178,7 @@ class ThreadManager:
         )
         return position
 
-    def _stash(
-        self, runner: ThreadRunner, text: str, attachments: Sequence[Attachment]
-    ) -> str:
+    def _stash(self, runner: ThreadRunner, text: str, attachments: Sequence[Attachment]) -> str:
         """Put attachments on disk and name them in the prompt.
 
         A path is the whole mechanism. `Read` renders images natively and is
@@ -265,8 +263,9 @@ class ThreadManager:
                 {"status": str(ThreadStatus.IDLE), "background_agents": 0},
             )
             recovered.append(row.thread_id)
-            log.info("recovered thread %s from %s (%d lost approvals)", row.thread_id,
-                     status, len(lost))
+            log.info(
+                "recovered thread %s from %s (%d lost approvals)", row.thread_id, status, len(lost)
+            )
         return recovered
 
     def _record(self, thread_id: str, type_: EventType, data: dict) -> None:

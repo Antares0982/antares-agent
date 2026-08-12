@@ -30,7 +30,7 @@ def tier(command: str, **extra: Any) -> Tier:
         "cd repo-a && git push",
         "bash -c 'git push origin main'",
         "GIT_SSH_COMMAND=ssh git push",
-        "make build && bash -c \"cd api && git push\"",
+        'make build && bash -c "cd api && git push"',
         "sh -c 'true; git push'",
     ],
 )
@@ -155,13 +155,9 @@ def test_writing_outside_the_workspace_is_escalated(tmp_path: Path) -> None:
     settings = Settings(workspace=workspace)
 
     assert classify("Write", {"file_path": "api/notes.md"}, settings).tier is Tier.SANDBOXED
-    assert classify(
-        "Edit", {"file_path": str(outside / "x.py")}, settings
-    ).tier is Tier.ASK
+    assert classify("Edit", {"file_path": str(outside / "x.py")}, settings).tier is Tier.ASK
     # Lexically inside, actually outside. The write follows the symlink.
-    assert classify(
-        "Write", {"file_path": "shortcut/x.py"}, settings
-    ).tier is Tier.ASK
+    assert classify("Write", {"file_path": "shortcut/x.py"}, settings).tier is Tier.ASK
 
 
 def test_path_rule_keeps_the_double_slash() -> None:

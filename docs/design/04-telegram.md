@@ -121,7 +121,7 @@ thread 会永久停在 `awaiting_approval` 没人应答。
 `api.py` 的事件流端点里是：
 
 ```python
-runner = await mgr.runner(thread_id)   # api.py:195
+runner = await mgr.runner(thread_id)  # api.py:195
 ```
 
 `ThreadManager.runner()` **会拉起或复活线程**（`manager.py:81`），也就是说
@@ -173,8 +173,9 @@ agent 侧不能自己取：`file_id` 只有拿 bot token 才兑得出来，而 t
 也该留在这边；Pi 的出网还走着一个与 Telegram 无关的代理。
 单个上限 10MB —— 字节要过总线、还要落在 agent 的工作区，这两笔开销和模型看不看它无关。
 无 caption 的图片是一条完整的消息，所以 `text` 允许为空。
-**agent → Telegram 方向没做**：现在唯一往回送的文件是 diff（`send_document`），
-真需要时按同样形状加一个事件即可。
+**agent → Telegram 方向**走 `file` 事件（`02-sse-api.md`）：agent 侧扫 outbox 目录并把
+base64 放进事件，bot 侧一个 `case` 分到 `sendPhoto`/`sendDocument`。relay 一行没改 ——
+这正是 D11 的分红：加一种往回送的东西只动两端，中间那段不需要知道。
 
 **已知限制**：两个 thread 同时输出正文时会交错，只有状态消息能区分来源。
 forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第二步。
@@ -183,6 +184,12 @@ forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第�
 用现成的 `longtext_markdown_split`。另开一条状态消息，1 秒节流 edit，
 显示当前工具与在跑的 subagent 数（`thread.status.background_agents`）。
 `message_id` 在本地，编辑零往返 —— 这正是 D11 换来的。
+
+另外 thread 非 idle 期间持续发 `sendChatAction(typing)`（约 5 秒过期，按 4 秒重发），
+按 **chat** 而不是 thread 计数——一个 chat 里两个 thread 同时在跑只该有一个循环。
+状态消息说的是「在做什么」，这条说的是「还在做」，且它出现在会话列表里，编辑消息不会。
+唯一数据源是 `thread.status` 事件与 `relay.thread_bound` 的 `status` 字段：
+切进一个跑到一半的 thread 时，它的 `busy` 早在 cursor 之前，只有后者还记得这件事。
 
 状态消息一轮里不止一条：正文 flush 会把当前这条封口（⏳ 换成 ✔️），
 下一次 `tool.call` 另起一条。一条编辑到底的话，模型说完话之后的每一步
@@ -216,3 +223,6 @@ socket 上变成 `[Errno 2]` —— 一次正常重启在聊天里刷出四条�
 - rpi 那张 mTLS 证书对应的用户需要对 exchange `agent` 有 `configure` 权限
   （已确认可以 declare，但 `rabbitmq-definitions.age` 是加密的，实际权限位未亲眼核对）
 - inbox 里的附件没有清理。thread 是软删的，它的附件目录会一直留着
+  （outbox 不在此列：文件发出即移走，一轮结束后目录是空的）
+- 发出去的文件其 base64 会连同事件落进 sqlite，等于同一份内容再存一遍。
+  10MB 上限下先这样，日志变胖再改成事件只带路径

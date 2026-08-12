@@ -68,8 +68,17 @@ def check_sandbox() -> PreflightReport:
     # command dies (F30).
     try:
         proc = subprocess.run(
-            ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--proc", "/proc",
-             "--die-with-parent", "true"],
+            [
+                "bwrap",
+                "--unshare-all",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--die-with-parent",
+                "true",
+            ],
             capture_output=True,
             timeout=15,
             check=False,

@@ -110,8 +110,11 @@ def test_tool_result_recovers_the_tool_name_and_agent_done() -> None:
     t = make()
     t.handle(
         assistant(
-            ToolUseBlock(id="toolu_a", name="Agent", input={"subagent_type": "Explore",
-                                                            "prompt": "look at web/"})
+            ToolUseBlock(
+                id="toolu_a",
+                name="Agent",
+                input={"subagent_type": "Explore", "prompt": "look at web/"},
+            )
         )
     )
     events = t.handle(
@@ -131,9 +134,7 @@ def test_tool_result_recovers_the_tool_name_and_agent_done() -> None:
 def test_preview_is_truncated() -> None:
     t = make()
     t.handle(assistant(ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})))
-    events = t.handle(
-        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="x" * 2000)])
-    )
+    events = t.handle(UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="x" * 2000)]))
     assert len(events[0].data["preview"]) == 501
 
 

@@ -135,8 +135,10 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
                 problems.append(f"{where} ({name}): {root / rel} does not exist")
 
         if not desc:
-            problems.append(f"{where} ({name}): missing `description` -- say *when* to reach for "
-                            "this repo, not what it is")
+            problems.append(
+                f"{where} ({name}): missing `description` -- say *when* to reach for "
+                "this repo, not what it is"
+            )
 
         if name and rel:
             repos.append(Repo(name=name, path=rel.strip("/"), description=desc))
@@ -158,8 +160,10 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
         if kind not in RELATION_KINDS:
             problems.append(f"{where}: kind {kind!r} not one of {sorted(RELATION_KINDS)}")
         if not note:
-            problems.append(f"{where}: missing `note` -- this is the main input to cross-repo "
-                            "decisions and has no other source")
+            problems.append(
+                f"{where}: missing `note` -- this is the main input to cross-repo "
+                "decisions and has no other source"
+            )
         if contract:
             err = _check_contained(str(contract), root, where=f"{where} contract")
             if err:
@@ -167,8 +171,13 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
 
         if src and dst and kind in RELATION_KINDS:
             relations.append(
-                Relation(src=src, dst=dst, kind=kind, note=note,
-                         contract=str(contract) if contract else None)
+                Relation(
+                    src=src,
+                    dst=dst,
+                    kind=kind,
+                    note=note,
+                    contract=str(contract) if contract else None,
+                )
             )
 
     if problems:

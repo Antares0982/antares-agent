@@ -78,7 +78,7 @@ def _unwrap(argv: list[str], depth: int = 0) -> list[list[str]]:
             if token == "-c" and i + 1 < len(argv):
                 inner = split_commands(argv[i + 1])
                 rest = argv[i + 2 :]
-                return [argv, *inner, *( _unwrap(rest, depth + 1) if rest else [])]
+                return [argv, *inner, *(_unwrap(rest, depth + 1) if rest else [])]
         rest = argv[1:]
         if rest and not rest[0].startswith("-"):
             # `sudo git push`, `env FOO=1 git push`, `nohup make`
@@ -115,7 +115,5 @@ def _has_flag(argv: list[str], flag: str) -> bool:
         return True
     # `-rf` should satisfy both `-r` and `-f`
     if len(flag) == 2 and flag.startswith("-") and not flag.startswith("--"):
-        return any(
-            a.startswith("-") and not a.startswith("--") and flag[1] in a[1:] for a in argv
-        )
+        return any(a.startswith("-") and not a.startswith("--") and flag[1] in a[1:] for a in argv)
     return False

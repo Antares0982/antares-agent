@@ -15,10 +15,7 @@ from pathlib import Path
 
 from .manifest import Manifest, Repo
 
-POINTER = (
-    "本目录是多仓库工作区。动手前先读 `.agent/workspace-index.md` "
-    "了解仓库划分与跨仓库约束。"
-)
+POINTER = "本目录是多仓库工作区。动手前先读 `.agent/workspace-index.md` 了解仓库划分与跨仓库约束。"
 _POINTER_MARK = "<!-- antares-agent:workspace-pointer -->"
 
 _KIND_LABEL = {

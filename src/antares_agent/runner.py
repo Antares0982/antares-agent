@@ -13,10 +13,13 @@ awaited: a `ResultMessage` counts only when nothing is still outstanding.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
+import mimetypes
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from claude_agent_sdk import (
@@ -46,11 +49,26 @@ def _is_shutdown(exc: BaseException) -> bool:
     """Did the CLI die because someone asked it to, rather than break?"""
     return getattr(exc, "exit_code", None) == _SIGTERM_EXIT
 
+
 #: Grace period after a ResultMessage before believing the thread is idle.
 #: `background_tasks_changed` can trail the ResultMessage it belongs to, and a
 #: spurious `idle` makes the client hide its progress indicator and start
 #: dequeuing. Cheap insurance; the spawn bookkeeping is the real check.
 IDLE_SETTLE_S = 0.4
+
+#: Cap on one outgoing file. Mirrors the inbound ceiling: the bytes cross the
+#: bus base64-encoded and land in the thread's event log on the way, so this is
+#: paid twice whether or not the user keeps the file.
+MAX_OUTBOX_BYTES = 10 * 1024 * 1024
+
+#: Where the model puts things it wants delivered. Said in the system prompt
+#: because the path is per thread and there is nowhere else the model could
+#: learn its own id -- the same reason `_stash` names the inbox path inline.
+OUTBOX_HINT = """
+要把文件（图片、报告、构建产物）发给用户，就复制一份到 `{path}`。
+每轮结束时该目录里的文件会被发出并移走，所以放进去的必须是副本，不是你之后还要读的原件。
+超过 10MB 的不会发出，只会告诉用户它太大了。
+"""
 
 
 class ClientFactory(Protocol):
@@ -103,6 +121,10 @@ class ThreadRunner:
         # the profile. The reported value has to follow it back, or the thread
         # would keep claiming a bypass that is no longer in effect.
         self.state.permission_mode = self.state.profile.permission_mode
+        # Created here rather than left to the model: a `cp` into a directory
+        # that does not exist fails, and the prompt would then be describing
+        # something that only works from tools which happen to mkdir -p.
+        self.outbox.mkdir(parents=True, exist_ok=True)
         self._client = self._new_client(options=self._options(resume))
         await self._client.connect()
         self._pump = asyncio.create_task(self._read_forever(), name=f"pump-{self.thread_id}")
@@ -127,6 +149,12 @@ class ThreadRunner:
     def busy(self) -> bool:
         return self.state.status is not ThreadStatus.IDLE
 
+    @property
+    def outbox(self) -> Path:
+        """Per thread, like the inbox: an event carries a thread id and that is
+        what tells the client which chat the file belongs to."""
+        return self.settings.workspace / self.manifest.scratch / "outbox" / self.thread_id
+
     # -- input -----------------------------------------------------------
 
     async def send(self, text: str) -> int | None:
@@ -140,8 +168,7 @@ class ThreadRunner:
             self.state.queue.append(text)
             position = len(self.state.queue)
             self.log.publish(
-                Event(type=EventType.QUEUED, thread_id=self.thread_id,
-                      data={"position": position})
+                Event(type=EventType.QUEUED, thread_id=self.thread_id, data={"position": position})
             )
             return position
 
@@ -155,8 +182,11 @@ class ThreadRunner:
             await self._client.interrupt()
         self.state.queue.clear()
         self.log.publish(
-            Event(type=EventType.ERROR, thread_id=self.thread_id,
-                  data={"code": "interrupted", "message": "已打断当前任务"})
+            Event(
+                type=EventType.ERROR,
+                thread_id=self.thread_id,
+                data={"code": "interrupted", "message": "已打断当前任务"},
+            )
         )
 
     async def set_permission_mode(self, mode: str) -> None:
@@ -213,13 +243,17 @@ class ThreadRunner:
                 return
             log.exception("thread %s message loop failed", self.thread_id)
             self.log.publish(
-                Event(type=EventType.ERROR, thread_id=self.thread_id,
-                      data={"code": "internal", "message": str(exc)})
+                Event(
+                    type=EventType.ERROR,
+                    thread_id=self.thread_id,
+                    data={"code": "internal", "message": str(exc)},
+                )
             )
             self._set_status(ThreadStatus.IDLE)
 
     async def _on_result(self) -> None:
         await self._publish_diffs()
+        self._publish_outbox()
         self._cancel_settle()
 
         if not self.translator.idle_possible:
@@ -264,6 +298,51 @@ class ThreadRunner:
                     },
                 )
             )
+
+    def _publish_outbox(self) -> None:
+        """Send whatever the turn left in the outbox, then take it out again.
+
+        Leaving the directory *is* the record of having been sent. A second
+        ledger -- a table, an mtime cursor -- would only have to be kept in
+        step with the filesystem, which already knows; and this way a restart
+        cannot replay the directory, because nothing outside a turn ever looks
+        at it and a finished turn leaves it empty.
+
+        Published first and removed after, so a crash in between costs a
+        duplicate rather than the file itself.
+        """
+        if not self.outbox.is_dir():
+            return
+        for path in sorted(p for p in self.outbox.iterdir() if p.is_file()):
+            try:
+                size = path.stat().st_size
+                # ponytail: the base64 lands in sqlite with the event, so a
+                # sent file is paid for once more in the log; point the event
+                # at a served path instead if the db gets fat.
+                data = b"" if size > MAX_OUTBOX_BYTES else path.read_bytes()
+            except OSError as exc:
+                log.warning("outbox: cannot read %s: %s", path, exc)
+                continue
+            self.log.publish(
+                Event(
+                    type=EventType.FILE,
+                    thread_id=self.thread_id,
+                    data={
+                        "name": path.name,
+                        "mime": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                        "size": size,
+                        **(
+                            {"reason": "too_large"}
+                            if size > MAX_OUTBOX_BYTES
+                            else {"data_b64": base64.b64encode(data).decode()}
+                        ),
+                    },
+                )
+            )
+            # The oversized ones leave too. Left in place they would be retried
+            # at the end of every turn from here on, forever.
+            with contextlib.suppress(OSError):
+                path.unlink()
 
     def _set_status(self, status: ThreadStatus) -> None:
         self.state.status = status
@@ -314,7 +393,13 @@ class ThreadRunner:
             env=env,
             resume=resume,
             setting_sources=["project"],
-            system_prompt={"type": "preset", "preset": "claude_code", "append": profile.append},
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                # Thread-specific, but still fixed for the thread's life, so
+                # D6 holds: nothing here changes after the session is created.
+                "append": profile.append + OUTBOX_HINT.format(path=self.outbox),
+            },
             permission_mode=profile.permission_mode,
             # Must stay empty: allow rules are evaluated ahead of
             # can_use_tool and would silently short-circuit it (F8).

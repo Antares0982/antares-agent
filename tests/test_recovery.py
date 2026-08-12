@@ -101,8 +101,11 @@ def test_a_crash_with_no_approval_pending_only_clears_the_status(
 def test_an_answered_approval_is_not_a_lost_one(manager: ThreadManager) -> None:
     thread_id = crashed_awaiting_approval(manager.store)
     append(
-        manager.store, thread_id, EventType.APPROVAL_RESOLVED,
-        approval_id="apr_111", decision="allow",
+        manager.store,
+        thread_id,
+        EventType.APPROVAL_RESOLVED,
+        approval_id="apr_111",
+        decision="allow",
     )
     append(manager.store, thread_id, EventType.THREAD_STATUS, status="busy")
 
@@ -117,8 +120,11 @@ def test_one_lost_approval_among_several_is_still_named(manager: ThreadManager) 
     thread_id = crashed_awaiting_approval(manager.store)
     append(manager.store, thread_id, EventType.APPROVAL_REQUIRED, approval_id="apr_222")
     append(
-        manager.store, thread_id, EventType.APPROVAL_RESOLVED,
-        approval_id="apr_222", decision="deny",
+        manager.store,
+        thread_id,
+        EventType.APPROVAL_RESOLVED,
+        approval_id="apr_222",
+        decision="deny",
     )
     manager.recover()
 

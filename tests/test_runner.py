@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -194,8 +195,9 @@ async def test_plain_turn_goes_idle(tmp_path: Path, fast_settle: None) -> None:
     r, client = await make(tmp_path)
     try:
         await r.send("hello")
-        client.emit(AssistantMessage(content=[TextBlock(text="hi")], model="m",
-                                     parent_tool_use_id=None))
+        client.emit(
+            AssistantMessage(content=[TextBlock(text="hi")], model="m", parent_tool_use_id=None)
+        )
         client.emit(result())
         await settle()
 
@@ -277,8 +279,9 @@ async def test_concurrent_approvals_are_independent(tmp_path: Path, fast_settle:
         b = asyncio.create_task(r._ask("Bash", {"command": "git rebase"}, "b", None))  # type: ignore[arg-type]
         await settle(2)
 
-        ids = [e.data["approval_id"] for e in r.log.since(0)
-               if e.type == EventType.APPROVAL_REQUIRED]
+        ids = [
+            e.data["approval_id"] for e in r.log.since(0) if e.type == EventType.APPROVAL_REQUIRED
+        ]
         assert len(set(ids)) == 2
 
         r.resolve_approval(ids[1], allow=False, message="不要")
@@ -307,11 +310,75 @@ async def test_approval_timeout_denies_and_reports(tmp_path: Path, fast_settle: 
     r.approvals._timeout = 0.05
     try:
         verdict = await asyncio.wait_for(
-            r._ask("Bash", {"command": "git push"}, "x", None), 2  # type: ignore[arg-type]
+            r._ask("Bash", {"command": "git push"}, "x", None),
+            2,  # type: ignore[arg-type]
         )
         assert verdict.allow is False
         codes = [e.data.get("code") for e in r.log.since(0) if e.type == EventType.ERROR]
         assert "approval_timeout" in codes
+    finally:
+        await r.close()
+
+
+# --- outbox --------------------------------------------------------------
+
+
+async def test_outbox_files_go_out_once_and_leave_the_directory(
+    tmp_path: Path, fast_settle: None
+) -> None:
+    """Leaving the directory is the whole 'already sent' record, so the second
+    turn must find nothing -- otherwise every later turn re-sends the file."""
+    r, client = await make(tmp_path)
+    try:
+        (r.outbox / "report.md").write_bytes(b"hello")
+        await r.send("go")
+        client.emit(result())
+        await settle()
+
+        files = [e for e in r.log.since(0) if e.type == EventType.FILE]
+        assert len(files) == 1
+        assert files[0].data["name"] == "report.md"
+        assert base64.b64decode(files[0].data["data_b64"]) == b"hello"
+        assert not list(r.outbox.iterdir())
+
+        await r.send("again")
+        client.emit(result())
+        await settle()
+        assert len([e for e in r.log.since(0) if e.type == EventType.FILE]) == 1
+    finally:
+        await r.close()
+
+
+async def test_an_oversized_file_is_reported_and_still_removed(
+    tmp_path: Path, fast_settle: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Left in place it would be retried at the end of every turn, forever.
+    monkeypatch.setattr(runner_mod, "MAX_OUTBOX_BYTES", 4)
+    r, client = await make(tmp_path)
+    try:
+        (r.outbox / "big.bin").write_bytes(b"12345")
+        await r.send("go")
+        client.emit(result())
+        await settle()
+
+        files = [e for e in r.log.since(0) if e.type == EventType.FILE]
+        assert [f.data["reason"] for f in files] == ["too_large"]
+        assert "data_b64" not in files[0].data
+        assert not list(r.outbox.iterdir())
+    finally:
+        await r.close()
+
+
+async def test_a_restart_alone_sends_nothing(tmp_path: Path) -> None:
+    """`start()` must not scan: only a finished turn does, so a process that
+    comes back up cannot replay a directory into the chat."""
+    r, _ = await make(tmp_path)
+    try:
+        (r.outbox / "left.txt").write_bytes(b"x")
+        await r.start(resume="s1")
+
+        assert [e for e in r.log.since(0) if e.type == EventType.FILE] == []
+        assert (r.outbox / "left.txt").exists()
     finally:
         await r.close()
 
