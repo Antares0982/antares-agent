@@ -16,6 +16,7 @@ import contextlib
 import logging
 import mimetypes
 import secrets
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -97,6 +98,10 @@ class ThreadManager:
             existing = self._live.get(thread_id)
             if existing is not None:
                 self._live.move_to_end(thread_id)
+                # Being asked for counts as activity. Without this the reaper
+                # could close a runner between here and the `send()` the caller
+                # is about to make on it.
+                existing.last_active = time.monotonic()
                 return existing
 
             row = self.store.get_thread(thread_id)
@@ -118,6 +123,11 @@ class ThreadManager:
                 # whole history again under reused ids.
                 event_log._next_id = self.store.last_event_id(thread_id) + 1
                 self._logs[thread_id] = event_log
+            else:
+                # The log outlives eviction, and `close()` left it closed --
+                # every later `stream()` would end right after its replay, so
+                # the thread would go on working with nobody able to follow it.
+                event_log.reopen()
 
             runner = ThreadRunner(
                 thread_id=thread_id,
@@ -142,9 +152,59 @@ class ThreadManager:
                 log.warning("all %d live threads are busy; not evicting", len(self._live))
                 return
             log.info("evicting idle thread %s", victim)
-            runner = self._live.pop(victim)
-            self.store.touch(victim, session_id=runner.state.session_id)
-            await runner.close()
+            await self._retire(victim)
+
+    async def _retire(self, thread_id: str) -> None:
+        """Drop a live runner, keeping everything a revive needs.
+
+        The caller holds `_lock`. The session id has to reach the store before
+        the client goes, or the next message starts a conversation from
+        nothing instead of resuming this one.
+        """
+        runner = self._live.pop(thread_id)
+        self.store.touch(thread_id, session_id=runner.state.session_id)
+        await runner.close()
+
+    async def reap_idle(self) -> list[str]:
+        """Close the CLI behind threads nobody has spoken to in a while.
+
+        A CPU measure, not a memory one. F31: once it has run a turn the CLI
+        keeps a ~60Hz loop going and costs a full core on the Pi for as long
+        as it lives, idle or not -- so a pool that only evicts under pressure
+        parks a spinning core per thread until something else needs the slot.
+        Eviction is lossless (the CLI keeps its session file), so the price of
+        being wrong here is one revive, paid by whoever speaks next.
+        """
+        ttl = self.settings.idle_ttl_s
+        if ttl <= 0:
+            return []
+        now = time.monotonic()
+        reaped: list[str] = []
+        async with self._lock:
+            for thread_id, runner in list(self._live.items()):
+                if runner.busy or now - runner.last_active < ttl:
+                    continue
+                log.info("reaping thread %s after %.0fs idle", thread_id, now - runner.last_active)
+                await self._retire(thread_id)
+                reaped.append(thread_id)
+        return reaped
+
+    async def reap_forever(self) -> None:
+        """The reaper's own loop. Cancelled at shutdown."""
+        ttl = self.settings.idle_ttl_s
+        if ttl <= 0:
+            return
+        while True:
+            # A quarter of the TTL: a thread is closed somewhere between one
+            # and one-and-a-quarter TTLs after its last turn, which is close
+            # enough for something whose only cost is a revive.
+            await asyncio.sleep(max(15.0, ttl / 4))
+            try:
+                await self.reap_idle()
+            except Exception:
+                # A failure here must not kill the loop; the next tick retries
+                # and the alternative is a core spinning until the next restart.
+                log.exception("idle reaper failed")
 
     async def close_thread(self, thread_id: str) -> None:
         runner = self._live.pop(thread_id, None)

@@ -689,6 +689,52 @@ tier 3 与 `classify()` 里的 **Bash 凭据路径检查**（F27 说明 deny 规
 
 ---
 
+## 运行期发现（2026-08-15，rpi5 空闲时 CPU 异常）
+
+### F31 ❌ 跑完一轮之后，空闲的 CLI 会一直烧掉一整个核
+
+现象是 `systemd` 自己记的账：
+
+```
+antares-agent.service: Consumed 1d 17h 53min 50s CPU time over 1d 22h 55min 13s wall clock
+```
+
+**92% 的一个核，连续两天**，而这两天里绝大部分时间没人跟 agent 说话。
+
+复现（rpi5，CLI 2.1.223，一次 `只回复两个字：收到` 的对话）：
+
+| 时刻 | thread.status | `claude` 进程 CPU |
+|---|---|---|
+| 刚 `connect()`，一轮都没跑 | idle | ~1%（25s 采样 26 ticks） |
+| 一轮结束后 60s | **idle** | **104%**（30s 采样 3474 ticks） |
+
+所以不是泄漏，也不是我们没关进程：**是活着的 CLI 本身在空转**，
+而线程池只在"要开第 7 个 thread"时才淘汰，于是每个停在池子里的 thread
+各自钉住一个核，直到下次重启。
+
+线程分布与 strace（主线程）指向 CLI 自己的定时循环，不是我们喂进去的东西：
+
+```
+claude 1083   HeapHelper 3012 / 2970 / 2964   mi-scavenger 35   Bun Pool ~24
+epoll_pwait2(..., {tv_nsec=15977056})   ← 稳定 16ms 一跳
+pread64(6</proc/self/statm>, ...)       ← 每秒约 17 次
+futex 89% + sched_yield 6698 次/6s      ← JSC 并行 GC 的自旋
+```
+
+一个 60Hz 的循环 + 每秒十几次读 `statm`，在 Pi 上就是这个价钱。上游的事，
+我们改不动。
+
+**已修**：`ANTARES_IDLE_TTL`（默认 300s）+ `ThreadManager.reap_idle()`。
+空闲超过 TTL 的 thread 直接按淘汰路径关掉 CLI，下条消息 `resume` 回来 ——
+淘汰本来就是无损的，代价只有一次重建。
+
+**顺带修掉的**：`EventLog.close()` 之后 `_closed` 再没被清过，而日志对象比
+runner 活得久（淘汰不删 `_logs`）。也就是说**一个 thread 被淘汰过一次之后，
+它后来的每个 SSE 流都会在 replay 完当场结束** —— 之前要 6 个 thread 才撞得到，
+加了 TTL 之后会变成常态。已加 `reopen()`，在复活时清掉。
+
+---
+
 ## 待办
 
 设计定稿所需的实测已全部完成。剩余项均为"边写边验"，不影响架构：

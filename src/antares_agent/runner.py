@@ -17,6 +17,7 @@ import base64
 import contextlib
 import logging
 import mimetypes
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,6 +112,9 @@ class ThreadRunner:
 
         self._new_client: ClientFactory = client_factory or ClaudeSDKClient
         self._client: ClaudeSDKClient | None = None
+        #: Monotonic stamp of the last status change, i.e. of the last thing
+        #: that happened on this thread. What the idle reaper measures.
+        self.last_active = time.monotonic()
         self._pump: asyncio.Task[None] | None = None
         self._settle: asyncio.Task[None] | None = None
 
@@ -346,6 +350,7 @@ class ThreadRunner:
 
     def _set_status(self, status: ThreadStatus) -> None:
         self.state.status = status
+        self.last_active = time.monotonic()
         self.log.publish(
             Event(
                 type=EventType.THREAD_STATUS,

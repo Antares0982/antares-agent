@@ -95,6 +95,12 @@ class Settings:
     #: one (PSS). 6 keeps a 8GB Pi comfortable.
     max_live_threads: int = 6
 
+    #: Seconds a thread may sit idle before its CLI is closed. Not a memory
+    #: knob -- a CPU one: after its first turn the CLI spins a ~60Hz loop and
+    #: costs a full core for as long as it lives (F31). Eviction is lossless
+    #: (`resume`), so the price is the revive on the next message. 0 disables.
+    idle_ttl_s: int = 300
+
     #: Events kept in memory per thread for `?after=` replay; older ones are
     #: served from sqlite.
     event_buffer: int = 512
@@ -131,6 +137,7 @@ class Settings:
             profiles_dir=_env_path("PROFILES_DIR") or workspace / ".agent" / "profiles",
             approval_timeout_s=_env_int("APPROVAL_TIMEOUT", 600),
             max_live_threads=_env_int("MAX_LIVE_THREADS", 6),
+            idle_ttl_s=_env_int("IDLE_TTL", 300),
             event_buffer=_env_int("EVENT_BUFFER", 512),
             require_sandbox=_env_bool("REQUIRE_SANDBOX", True),
             extra_denied_tools=tuple(x for x in extra_deny.split(",") if x.strip()),

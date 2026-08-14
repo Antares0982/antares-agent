@@ -54,6 +54,17 @@ class EventLog:
         for queue in self._subscribers:
             queue.put_nowait(None)
 
+    def reopen(self) -> None:
+        """Take a closed log back into service.
+
+        A log outlives the runner it belonged to: eviction closes it to end the
+        streams (the relay reads that as "stopped", D13) but the thread itself
+        is only cold, and the same log carries on when it revives. Without this
+        the flag would stay set and every later `stream()` would end straight
+        after its replay, leaving a working thread nobody can follow.
+        """
+        self._closed = False
+
     async def stream(self, after: int | None = None) -> AsyncIterator[Event]:
         """Replay the gap, then follow live.
 

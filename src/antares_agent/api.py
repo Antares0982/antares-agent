@@ -8,12 +8,13 @@ See docs/design/02-sse-api.md.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -85,9 +86,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Before the first request, so a client that reconnects immediately
         # reads the correction rather than the crash's last word.
         app.state.manager.recover()
+        # An idle CLI is not a parked one: it spins a core until it is closed
+        # (F31), so idleness has to be evicted on, not just pool pressure.
+        reaper = asyncio.create_task(app.state.manager.reap_forever(), name="idle-reaper")
         try:
             yield
         finally:
+            reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper
             await app.state.manager.shutdown()
             store.close()
 

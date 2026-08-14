@@ -109,6 +109,22 @@ async def test_close_ends_open_streams() -> None:
     assert await asyncio.wait_for(task, 1) == ["a"]
 
 
+async def test_a_reopened_log_can_be_followed_again() -> None:
+    # The log outlives the runner: eviction closes it, the next message revives
+    # the thread on the same log. Without `reopen` every later stream would end
+    # right after its replay and the turn would run with nobody following it.
+    log = make()
+    log.publish(text("thr_1", "before"))
+    log.close()
+
+    log.reopen()
+    task = asyncio.create_task(collect(log, after=1, want=1))
+    await asyncio.sleep(0.02)
+    log.publish(text("thr_1", "after"))
+
+    assert await asyncio.wait_for(task, 1) == ["after"]
+
+
 async def test_a_stalled_subscriber_never_blocks_publishing() -> None:
     log = make()
     log.publish(text("thr_1", "first"))

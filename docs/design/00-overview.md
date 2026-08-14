@@ -228,7 +228,7 @@ bwrap `--unshare-all` 用到的其余 namespace 全被挡；`SystemCallFilter=@s
 | **V1** | 审批 Future 在进程重启后的行为 | 决定 pending approval 是否需持久化 | ✅ 不需持久化，需重试入口 |
 | **V2** | 仓库置于 cwd 之下时，skill 发现 / CLAUDE.md 层级 | 验证 D2 的前提 | ✅ 两者均懒加载，主 agent 与 subagent 皆然，无需物化步骤 |
 | **V3** | Pi 上跑通：arm64 二进制 + bubblewrap userns + systemd 硬化 | 部署可行性 | ✅ 硬化组合与 CLI 路线均已定 |
-| **V4** | 并发 thread 的内存占用，确定 LRU 上限 | 资源规划 | ✅ 首个 218MB，增量 123MB → LRU 取 6–8 |
+| **V4** | 并发 thread 的内存占用，确定 LRU 上限 | 资源规划 | ✅ 首个 218MB，增量 123MB → LRU 取 6–8。**限制 thread 数还不够**：跑过一轮的 CLI 空闲时也要烧掉一个核（F31），因此另有 `ANTARES_IDLE_TTL`（默认 300s）按空闲时长淘汰 |
 | **V5** | 扇出是否真的发生、索引 helper 是否够用 | 验证 D9 | ✅ `deepseek-v4-pro` 正确编排；连带发现 F25 并改写 D1 |
 
 余下条目**只影响实现细节、不影响上述决策**，边写边验：D1 的打断/drain 边界（与 F25 的多个
