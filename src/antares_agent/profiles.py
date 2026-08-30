@@ -119,7 +119,14 @@ def load(settings: Settings) -> dict[str, Profile]:
             log.error("ignoring profile %s: %s", path, exc)
             continue
 
-        append = str(raw.get("append", ""))
+        # Merged over the built-in, not substituted for it. `materialise`
+        # never rewrites a file that already exists, so a profile written by
+        # an older version is missing every key added since -- and a missing
+        # `model` is invisible: the CLI silently falls back to its default
+        # tier, which is opus, so `quick` ran on the expensive model.
+        base = profiles.get(name) or Profile(name=name)
+
+        append = base.append
         append_file = raw.get("append_file")
         if append_file:
             candidate = directory / str(append_file)
@@ -127,15 +134,17 @@ def load(settings: Settings) -> dict[str, Profile]:
                 append = candidate.read_text(encoding="utf-8")
             except OSError as exc:
                 log.error("profile %s: cannot read %s: %s", name, candidate, exc)
+        elif "append" in raw:
+            append = str(raw["append"])
 
         profiles[name] = Profile(
             name=name,
-            description=str(raw.get("description", "")),
+            description=str(raw.get("description", base.description)),
             append=append,
-            permission_mode=raw.get("permission_mode", "acceptEdits"),
-            model=raw.get("model"),
-            effort=raw.get("effort"),
-            max_turns=raw.get("max_turns"),
+            permission_mode=raw.get("permission_mode", base.permission_mode),
+            model=raw.get("model", base.model),
+            effort=raw.get("effort", base.effort),
+            max_turns=raw.get("max_turns", base.max_turns),
         )
     return profiles
 
