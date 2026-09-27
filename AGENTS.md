@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to agents when working with code in this repository.
 
 ## What this is
 
@@ -29,7 +29,7 @@ The live test drives a real `claude` binary and a real model endpoint; it is ski
 ```bash
 ANTARES_LIVE=1 ANTARES_LIVE_KEY_FILE=~/configs/deepseek_api_key.txt \
 ANTARES_LIVE_BASE_URL=https://api.deepseek.com/anthropic \
-ANTARES_LIVE_MODEL=deepseek-v4-flash \
+ANTARES_LIVE_MODEL=deepseek-v4.1-flash \
 .venv/bin/pytest tests/test_live.py -v
 ```
 
