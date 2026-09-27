@@ -13,10 +13,9 @@ awaited: a `ResultMessage` counts only when nothing is still outstanding.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
+import json
 import logging
-import mimetypes
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from claude_agent_sdk import (
 
 from . import gitdiff
 from .approvals import ApprovalBroker
+from .artifacts import Artifacts, signature
 from .config import Settings
 from .eventlog import EventLog
 from .events import Event, EventType, ThreadStatus
@@ -57,18 +57,10 @@ def _is_shutdown(exc: BaseException) -> bool:
 #: dequeuing. Cheap insurance; the spawn bookkeeping is the real check.
 IDLE_SETTLE_S = 0.4
 
-#: Cap on one outgoing file. Mirrors the inbound ceiling: the bytes cross the
-#: bus base64-encoded and land in the thread's event log on the way, so this is
-#: paid twice whether or not the user keeps the file.
-MAX_OUTBOX_BYTES = 10 * 1024 * 1024
-
-#: Where the model puts things it wants delivered. Said in the system prompt
-#: because the path is per thread and there is nowhere else the model could
-#: learn its own id -- the same reason `_stash` names the inbox path inline.
 OUTBOX_HINT = """
 要把文件（图片、报告、构建产物）发给用户，就复制一份到 `{path}`。
-每轮结束时该目录里的文件会被发出并移走，所以放进去的必须是副本，不是你之后还要读的原件。
-超过 10MB 的不会发出，只会告诉用户它太大了。
+每轮结束时接收副本并在后台发送，接收成功后副本移走；请保留你之后还要读的原件。
+单个文件上限 {limit} 字节；接收失败时保留副本并报告原因。
 """
 
 
@@ -102,7 +94,11 @@ class ThreadRunner:
         profile: Profile,
         event_log: EventLog | None = None,
         client_factory: ClientFactory | None = None,
+        artifacts: Artifacts | None = None,
     ) -> None:
+        self.artifacts = artifacts
+        self._owns_artifacts = artifacts is None
+        self._outbox_errors: dict[str, str] = {}
         self.settings = settings
         self.manifest = manifest
         self.state = ThreadState(thread_id=thread_id, profile=profile)
@@ -144,6 +140,9 @@ class ThreadRunner:
             with contextlib.suppress(Exception):
                 await self._client.disconnect()
         self.log.close()
+        if self._owns_artifacts and self.artifacts is not None:
+            self.artifacts.close()
+            self.artifacts = None
 
     @property
     def thread_id(self) -> str:
@@ -257,7 +256,7 @@ class ThreadRunner:
 
     async def _on_result(self) -> None:
         await self._publish_diffs()
-        self._publish_outbox()
+        await self._publish_outbox()
         self._cancel_settle()
 
         if not self.translator.idle_possible:
@@ -303,50 +302,42 @@ class ThreadRunner:
                 )
             )
 
-    def _publish_outbox(self) -> None:
-        """Send whatever the turn left in the outbox, then take it out again.
-
-        Leaving the directory *is* the record of having been sent. A second
-        ledger -- a table, an mtime cursor -- would only have to be kept in
-        step with the filesystem, which already knows; and this way a restart
-        cannot replay the directory, because nothing outside a turn ever looks
-        at it and a finished turn leaves it empty.
-
-        Published first and removed after, so a crash in between costs a
-        duplicate rather than the file itself.
-        """
+    async def _publish_outbox(self) -> None:
         if not self.outbox.is_dir():
             return
-        for path in sorted(p for p in self.outbox.iterdir() if p.is_file()):
-            try:
-                size = path.stat().st_size
-                # ponytail: the base64 lands in sqlite with the event, so a
-                # sent file is paid for once more in the log; point the event
-                # at a served path instead if the db gets fat.
-                data = b"" if size > MAX_OUTBOX_BYTES else path.read_bytes()
-            except OSError as exc:
-                log.warning("outbox: cannot read %s: %s", path, exc)
+        for path in sorted(self.outbox.iterdir()):
+            if path.is_dir() and not path.is_symlink():
                 continue
-            self.log.publish(
-                Event(
-                    type=EventType.FILE,
-                    thread_id=self.thread_id,
-                    data={
-                        "name": path.name,
-                        "mime": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-                        "size": size,
-                        **(
-                            {"reason": "too_large"}
-                            if size > MAX_OUTBOX_BYTES
-                            else {"data_b64": base64.b64encode(data).decode()}
-                        ),
-                    },
+            stamp = ""
+            try:
+                stamp = signature(path)
+                if self.artifacts is None:
+                    self.artifacts = Artifacts(self.settings.artifact_path)
+                row = await self.artifacts.collect(
+                    self.thread_id, path, self.settings.max_file_bytes
                 )
-            )
-            # The oversized ones leave too. Left in place they would be retried
-            # at the end of every turn from here on, forever.
-            with contextlib.suppress(OSError):
-                path.unlink()
+                if not row["published"]:
+                    self.log.publish(
+                        Event(
+                            type=EventType.FILE,
+                            thread_id=self.thread_id,
+                            data=json.loads(row["metadata"]),
+                        )
+                    )
+                    self.artifacts.published(row["id"])
+                if signature(path) == row["signature"]:
+                    path.unlink()
+                self._outbox_errors.pop(str(path), None)
+            except (OSError, ValueError) as exc:
+                if self._outbox_errors.get(str(path)) != stamp:
+                    self.log.publish(
+                        Event(
+                            type=EventType.ERROR,
+                            thread_id=self.thread_id,
+                            data={"code": "file_failed", "message": f"{path.name} 未接收：{exc}"},
+                        )
+                    )
+                    self._outbox_errors[str(path)] = stamp
 
     def _set_status(self, status: ThreadStatus) -> None:
         self.state.status = status
@@ -408,7 +399,8 @@ class ThreadRunner:
                 "preset": "claude_code",
                 # Thread-specific, but still fixed for the thread's life, so
                 # D6 holds: nothing here changes after the session is created.
-                "append": profile.append + OUTBOX_HINT.format(path=self.outbox),
+                "append": profile.append
+                + OUTBOX_HINT.format(path=self.outbox, limit=self.settings.max_file_bytes),
             },
             permission_mode=profile.permission_mode,
             # Must stay empty: allow rules are evaluated ahead of

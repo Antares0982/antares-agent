@@ -373,3 +373,50 @@ def test_event_ids_continue_across_a_restart(settings: Settings) -> None:
         assert store.last_event_id("thr_x") == 7
     finally:
         store.close()
+
+
+def test_file_references(client: TestClient, settings: Settings) -> None:
+    import hashlib
+
+    thread_id = new_thread(client)
+    data = b"file contents"
+    item = {
+        "artifact_id": "a" * 32,
+        "name": "../../report.txt",
+        "mime": "text/plain",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    route = f"/v1/threads/{thread_id}/attachments/{item['artifact_id']}"
+    params = {k: v for k, v in item.items() if k != "artifact_id"}
+    assert client.put(route, params=params, content=data).status_code == 200
+    assert client.put(route, params=params, content=data).status_code == 200
+    assert client.put(route, params=params, content=b"x" * len(data)).status_code == 422
+    body = {"text": "inspect", "attachments": [item], "request_id": "b" * 32}
+    response = client.post(f"/v1/threads/{thread_id}/messages", json=body)
+    assert response.status_code == 202
+    assert client.post(f"/v1/threads/{thread_id}/messages", json=body).json() == response.json()
+    assert len(client.started[-1].sent) == 1
+    inbox = settings.workspace / ".agent" / "inbox" / thread_id
+    assert [p.read_bytes() for p in inbox.iterdir()] == [data]
+    other = new_thread(client)
+    assert (
+        client.post(f"/v1/threads/{other}/messages", json={"attachments": [item]}).status_code
+        == 422
+    )
+    body["text"] = "changed"
+    assert client.post(f"/v1/threads/{thread_id}/messages", json=body).status_code == 409
+
+
+def test_uncertain_requests(client: TestClient) -> None:
+    import hashlib
+
+    from antares_agent.api import NewMessage
+
+    thread_id = new_thread(client)
+    body = NewMessage(text="run", request_id="c" * 32)
+    fingerprint = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
+    client.app.state.store.begin_request(body.request_id, thread_id, fingerprint)
+    response = client.post(f"/v1/threads/{thread_id}/messages", json=body.model_dump())
+    assert response.status_code == 409
+    assert not client.started

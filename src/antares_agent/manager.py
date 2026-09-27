@@ -13,17 +13,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import mimetypes
 import secrets
+import shutil
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import index
 from . import manifest as manifest_mod
 from . import profiles as profiles_mod
+from .artifacts import Artifacts
 from .config import Settings
 from .eventlog import EventLog
 from .events import Event, EventType, ThreadStatus
@@ -44,21 +48,17 @@ class UnknownProfile(KeyError):
 
 @dataclass(frozen=True)
 class Attachment:
-    """A file that arrived with a message, already decoded.
-
-    `name` is whatever the sender called it and is never used as a path --
-    see `ThreadManager._stash`.
-    """
-
     name: str
     mime: str
-    data: bytes
+    data: bytes = b""
+    path: Path | None = None
 
 
 class ThreadManager:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
+        self.artifacts = Artifacts(settings.artifact_path)
         self.profiles: dict[str, Profile] = profiles_mod.load(settings)
         self._live: OrderedDict[str, ThreadRunner] = OrderedDict()
         self._logs: dict[str, EventLog] = {}
@@ -135,6 +135,7 @@ class ThreadManager:
                 manifest=self.reload_manifest(),
                 profile=profile,
                 event_log=event_log,
+                artifacts=self.artifacts,
             )
             runner.state.session_id = row.session_id
             runner.state.summary = row.summary
@@ -223,6 +224,7 @@ class ThreadManager:
         for thread_id in list(self._live):
             with contextlib.suppress(Exception):
                 await self.close_thread(thread_id)
+        self.artifacts.close()
 
     # -- input -----------------------------------------------------------
 
@@ -230,7 +232,8 @@ class ThreadManager:
         self, thread_id: str, text: str, attachments: Sequence[Attachment] = ()
     ) -> int | None:
         runner = await self.runner(thread_id)
-        position = await runner.send(self._stash(runner, text, attachments))
+        prompt = await asyncio.to_thread(self._stash, runner, text, attachments)
+        position = await runner.send(prompt)
         self.store.touch(
             thread_id,
             session_id=runner.state.session_id,
@@ -261,7 +264,17 @@ class ThreadManager:
         lines: list[str] = []
         for item in attachments:
             path = inbox / (secrets.token_hex(4) + _suffix(item.mime))
-            path.write_bytes(item.data)
+            if item.path is None:
+                path.write_bytes(item.data)
+            else:
+                if shutil.disk_usage(inbox).free < item.path.stat().st_size:
+                    raise OSError("工作区磁盘空间不足")
+                temporary = path.with_suffix(path.suffix + ".part")
+                try:
+                    shutil.copyfile(item.path, temporary)
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
             kind = "图片" if item.mime.startswith("image/") else "文件"
             named = f" {item.name}" if item.name else ""
             lines.append(f"[用户发来{kind}{named}]：{path}")
@@ -298,6 +311,22 @@ class ThreadManager:
         leaves one behind, because the status only returns to `busy` once the
         last pending approval resolves, so this never misses one.
         """
+        for row in self.artifacts.list("outgoing"):
+            if not row["published"] and self.store.get_thread(row["thread"]):
+                if not self.store.has_artifact(row["id"]):
+                    self._record(row["thread"], EventType.FILE, json.loads(row["metadata"]))
+                self.artifacts.published(row["id"])
+        for request in self.store.interrupt_requests():
+            self._record(
+                request["thread"],
+                EventType.ERROR,
+                {
+                    "code": "message_uncertain",
+                    "request_id": request["id"],
+                    "message": "进程重启，消息交接结果不确定；请检查会话后重新发送。",
+                },
+            )
+        self.artifacts.cleanup()
         recovered: list[str] = []
         for row in self.store.list_threads(limit=10_000):
             status = self.store.last_status(row.thread_id)

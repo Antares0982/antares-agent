@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -18,13 +19,17 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 from . import index, preflight
 from . import profiles as profiles_mod
 from .approvals import UnknownApproval
+from .artifacts import MAX_BYTES, descriptor
 from .config import Settings
+from .events import Event, EventType
 from .manager import Attachment, ThreadManager, UnknownProfile, UnknownThread
 from .store import Store
 
@@ -47,9 +52,23 @@ class AttachmentIn(BaseModel):
     data_b64: str = Field(min_length=1, max_length=MAX_ATTACHMENT_B64)
 
 
+class ArtifactIn(BaseModel):
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    name: str = Field(max_length=256)
+    mime: str = Field(max_length=128)
+    size: int = Field(ge=0, le=MAX_BYTES, strict=True)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TransferResult(BaseModel):
+    state: Literal["transferred", "failed"] = "transferred"
+    error: str = Field("", max_length=512)
+
+
 class NewMessage(BaseModel):
     text: str = ""
-    attachments: list[AttachmentIn] = Field(default_factory=list, max_length=10)
+    attachments: list[AttachmentIn | ArtifactIn] = Field(default_factory=list, max_length=10)
+    request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @model_validator(mode="after")
     def _not_empty(self) -> NewMessage:
@@ -89,9 +108,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # An idle CLI is not a parked one: it spins a core until it is closed
         # (F31), so idleness has to be evicted on, not just pool pressure.
         reaper = asyncio.create_task(app.state.manager.reap_forever(), name="idle-reaper")
+
+        async def clean_files() -> None:
+            while True:
+                await asyncio.sleep(3600)
+                try:
+                    app.state.manager.artifacts.cleanup()
+                except OSError:
+                    log.exception("artifact cleanup failed")
+
+        file_reaper = asyncio.create_task(clean_files(), name="file-reaper")
         try:
             yield
         finally:
+            file_reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await file_reaper
             reaper.cancel()
             with suppress(asyncio.CancelledError):
                 await reaper
@@ -168,25 +200,111 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- conversation ----------------------------------------------------
 
+    @app.get("/v1/artifacts")
+    async def pending_artifacts(request: Request) -> dict:
+        artifacts = manager(request).artifacts
+        return {
+            "artifacts": [
+                {
+                    **json.loads(row["metadata"]),
+                    "created": row["created"],
+                    "thread_id": row["thread"],
+                }
+                for row in artifacts.list("outgoing")
+            ]
+        }
+
+    @app.get("/v1/artifacts/{artifact_id}")
+    async def download_artifact(artifact_id: str, request: Request) -> FileResponse:
+        artifacts = manager(request).artifacts
+        try:
+            row = artifacts.get(artifact_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if not row or row["direction"] != "outgoing" or not artifacts.path(artifact_id).is_file():
+            raise HTTPException(404, "文件不存在或已过期")
+        artifacts.active.add(artifact_id)
+        return FileResponse(
+            artifacts.path(artifact_id),
+            media_type="application/octet-stream",
+            background=BackgroundTask(artifacts.active.discard, artifact_id),
+        )
+
+    @app.post("/v1/artifacts/{artifact_id}/complete")
+    async def complete_artifact(artifact_id: str, body: TransferResult, request: Request) -> dict:
+        mgr = manager(request)
+        try:
+            row = mgr.artifacts.get(artifact_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if not row or row["direction"] != "outgoing":
+            raise HTTPException(404, "文件不存在")
+        if row["state"] == "pending" and body.state == "failed":
+            data = {"code": "file_failed", "message": f"文件传输失败：{body.error}"}
+            event_log = mgr.event_log(row["thread"])
+            if event_log:
+                event_log.publish(Event(type=EventType.ERROR, thread_id=row["thread"], data=data))
+            else:
+                mgr._record(row["thread"], EventType.ERROR, data)
+        mgr.artifacts.mark(artifact_id, body.state)
+        return {"status": body.state}
+
+    @app.put("/v1/threads/{thread_id}/attachments/{artifact_id}")
+    async def upload_attachment(
+        thread_id: str,
+        artifact_id: str,
+        request: Request,
+        name: str = Query(max_length=256),
+        mime: str = Query(max_length=128),
+        size: int = Query(ge=0, le=MAX_BYTES),
+        sha256: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    ) -> dict:
+        mgr = manager(request)
+        if mgr.store.get_thread(thread_id) is None:
+            raise HTTPException(404, "会话不存在")
+        if size > mgr.settings.max_file_bytes:
+            raise HTTPException(413, "文件大小超限")
+        if request.headers.get("content-length") != str(size):
+            raise HTTPException(411, "需要准确的 Content-Length")
+        try:
+            data = descriptor(
+                dict(artifact_id=artifact_id, name=name, mime=mime, size=size, sha256=sha256)
+            )
+            await mgr.artifacts.receive(thread_id, data, request.stream())
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(507, "附件写入失败") from exc
+        return data
+
     @app.post("/v1/threads/{thread_id}/messages", status_code=202)
     async def post_message(thread_id: str, body: NewMessage, request: Request) -> dict[str, Any]:
-        # Returns immediately rather than awaiting the turn, so that queueing
-        # (D1) has a natural expression: the client learns its position from
-        # the event stream instead of a blocked request.
+        mgr = manager(request)
+        if mgr.store.get_thread(thread_id) is None:
+            raise HTTPException(404, "会话不存在")
+        fingerprint = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
+        if body.request_id and (previous := mgr.store.request(body.request_id)):
+            if previous["thread"] != thread_id or previous["fingerprint"] != fingerprint:
+                raise HTTPException(409, "请求标识冲突")
+            if previous["state"] not in ("accepted", "settled"):
+                raise HTTPException(409, "消息交接结果不确定，请检查会话后重新发送")
+            return json.loads(previous["result"])
         try:
-            # Decoded here so bad base64 is a 422 about the request rather
-            # than a 500 from somewhere deeper.
             attachments = [
-                Attachment(a.name, a.mime, base64.b64decode(a.data_b64, validate=True))
+                Attachment(a.name, a.mime, path=mgr.artifacts.resolve(thread_id, a.model_dump()))
+                if isinstance(a, ArtifactIn)
+                else Attachment(a.name, a.mime, base64.b64decode(a.data_b64, validate=True))
                 for a in body.attachments
             ]
-        except binascii.Error as exc:
-            raise HTTPException(422, "attachment is not valid base64") from exc
-        try:
-            position = await manager(request).send(thread_id, body.text, attachments)
-        except UnknownThread as exc:
-            raise HTTPException(404, "unknown thread") from exc
-        return {"status": "queued" if position else "accepted", "position": position}
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if body.request_id:
+            mgr.store.begin_request(body.request_id, thread_id, fingerprint)
+        position = await mgr.send(thread_id, body.text, attachments)
+        result = {"status": "queued" if position else "accepted", "position": position}
+        if body.request_id:
+            mgr.store.finish_request(body.request_id, result)
+        return result
 
     @app.post("/v1/threads/{thread_id}/approve")
     async def approve(thread_id: str, body: Approval, request: Request) -> dict[str, str]:

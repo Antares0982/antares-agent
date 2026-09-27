@@ -21,6 +21,10 @@ from pathlib import Path
 from .events import Event, EventType
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+    id TEXT PRIMARY KEY, thread TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL, result TEXT
+);
 CREATE TABLE IF NOT EXISTS threads (
     thread_id      TEXT PRIMARY KEY,
     profile        TEXT NOT NULL,
@@ -68,6 +72,45 @@ class Store:
 
     def close(self) -> None:
         self._db.close()
+
+    def has_artifact(self, artifact_id: str) -> bool:
+        return (
+            self._db.execute(
+                "SELECT 1 FROM events WHERE type='file' "
+                "AND json_extract(payload,'$.artifact_id')=?",
+                (artifact_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def request(self, request_id: str) -> dict | None:
+        row = self._db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def begin_request(self, request_id: str, thread: str, fingerprint: str) -> None:
+        self._db.execute(
+            "INSERT INTO requests VALUES(?,?,?,'dispatching',NULL)",
+            (request_id, thread, fingerprint),
+        )
+        self._db.commit()
+
+    def finish_request(self, request_id: str, result: dict) -> None:
+        self._db.execute(
+            "UPDATE requests SET state='accepted',result=? WHERE id=?",
+            (json.dumps(result), request_id),
+        )
+        self._db.commit()
+
+    def interrupt_requests(self) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT id,thread FROM requests WHERE state='dispatching' OR "
+            "(state='accepted' AND json_extract(result,'$.status')='queued')"
+        ).fetchall()
+        self._db.executemany(
+            "UPDATE requests SET state='uncertain' WHERE id=?", [(r["id"],) for r in rows]
+        )
+        self._db.commit()
+        return [dict(row) for row in rows]
 
     # -- threads ---------------------------------------------------------
 
@@ -128,6 +171,11 @@ class Store:
                 json.dumps(event.payload(), ensure_ascii=False),
             ),
         )
+        if event.type == EventType.THREAD_STATUS and event.data.get("status") == "idle":
+            self._db.execute(
+                "UPDATE requests SET state='settled' WHERE thread=? AND state='accepted'",
+                (event.thread_id,),
+            )
         self._db.commit()
 
     def events_since(self, thread_id: str, after: int, limit: int = 2000) -> list[dict]:

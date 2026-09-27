@@ -39,8 +39,10 @@ import contextlib
 import json
 import logging
 import os
+import sqlite3
 import ssl
 import time
+from pathlib import Path
 from typing import Any
 
 import aio_pika
@@ -90,6 +92,7 @@ class Relay:
     _retry_delay = 3.0
 
     def __init__(self, http: httpx.AsyncClient) -> None:
+        self.transfers = None
         self._http = http
         self._exchange: aio_pika.abc.AbstractExchange | None = None
         #: One follower task per thread. The key is what keeps a burst of
@@ -162,7 +165,7 @@ class Relay:
 
     async def _publish(self, type_: str, payload: dict[str, Any]) -> None:
         if self._exchange is None:
-            return
+            raise ConnectionError("消息总线未连接")
         body = json.dumps({"type": type_, "payload": payload}, ensure_ascii=False).encode()
         await self._exchange.publish(
             aio_pika.Message(body=body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
@@ -170,18 +173,22 @@ class Relay:
         )
 
     async def _on_command(self, message: aio_pika.abc.AbstractIncomingMessage) -> None:
-        # `requeue=False`: a command that raised will raise again, and an
-        # infinite redelivery loop is worse than a dropped command the user can
-        # simply retype.
-        async with message.process(requeue=False):
+        async with message.process(requeue=True):
             try:
                 cmd = json.loads(message.body)
-            except json.JSONDecodeError:
+                if not isinstance(cmd, dict) or not isinstance(cmd.get("op"), str):
+                    raise ValueError("命令格式无效")
+            except ValueError:
                 log.warning("undecodable command: %.100s", message.body)
                 return
             try:
-                await self._dispatch(cmd)
+                if self.transfers is not None and cmd.get("op") == "message":
+                    self.transfers.enqueue(cmd)
+                else:
+                    await self._dispatch(cmd)
             except Exception as exc:
+                if self.transfers is not None and isinstance(exc, sqlite3.Error):
+                    raise
                 log.exception("command failed: %s", cmd.get("op"))
                 await self._publish(
                     CMD_FAILED,
@@ -224,6 +231,7 @@ class Relay:
                     {
                         "text": cmd.get("text", ""),
                         "attachments": cmd.get("attachments") or [],
+                        **({"request_id": cmd["request_id"]} if "request_id" in cmd else {}),
                     },
                 )
                 self._follow(thread_id, cmd.get("after"))
@@ -435,7 +443,35 @@ def main() -> int:
 
     async def run() -> None:
         async with _http_client() as http:
-            await Relay(http).run()
+            relay = Relay(http)
+            endpoint = os.environ.get("ANTARES_FILE_URL")
+            if not endpoint:
+                await relay.run()
+                return
+            if not endpoint.startswith("https://"):
+                raise ValueError("文件服务必须使用 HTTPS")
+            from .transfers import Transfers
+
+            async with httpx.AsyncClient(
+                base_url=endpoint,
+                auth=(os.environ["ANTARES_FILE_USER"], os.environ["ANTARES_FILE_PASSWORD"]),
+                timeout=httpx.Timeout(120, connect=30),
+                trust_env=False,
+            ) as remote:
+                relay.transfers = Transfers(
+                    relay, remote, Path(os.environ["ANTARES_RELAY_STATE"]) / "transfers.sqlite"
+                )
+                tasks = [
+                    asyncio.create_task(relay.run()),
+                    asyncio.create_task(relay.transfers.run()),
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    relay.transfers.jobs.close()
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run())

@@ -167,15 +167,14 @@ POST /messages  →  打开 ?after=<last>  →  跟流  →  见 thread.status:i
 （前缀只加在状态消息上：正文是带预计算 markdown entity 发的，
 前置任何字符都会让 offset 整体错位）。
 
-**图片与文件**：照片和 document 都在 `_on_message` 里下下来，base64 跟着
-`{"op": "message"}` 一起过总线（hermes 那套办法，`02-sse-api.md`「附件」定义了载荷）。
-agent 侧不能自己取：`file_id` 只有拿 bot token 才兑得出来，而 token 在这边、
-也该留在这边；Pi 的出网还走着一个与 Telegram 无关的代理。
-单个上限 10MB —— 字节要过总线、还要落在 agent 的工作区，这两笔开销和模型看不看它无关。
-无 caption 的图片是一条完整的消息，所以 `text` 允许为空。
-**agent → Telegram 方向**走 `file` 事件（`02-sse-api.md`）：agent 侧扫 outbox 目录并把
-base64 放进事件，bot 侧一个 `case` 分到 `sendPhoto`/`sendDocument`。relay 一行没改 ——
-这正是 D11 的分红：加一种往回送的东西只动两端，中间那段不需要知道。
+**图片与文件**：启用文件通道时，总线只携带 ID、名称、MIME、大小和摘要。
+alice 通过同机 Local Bot API 获取本地文件路径，复制至 hk 的 incoming 目录；
+relay 从 `tg.alyr.dev` 下载并流式转交 agent。反向则由 relay PUT 到 hk 的 outgoing
+目录，alice 校验文件后通过本地路径上传 Telegram。无 caption 的图片仍是一条完整消息。
+
+文件任务单独持久化、退避重试，普通消息保持同线程顺序；审批和中断不等待文件传输。
+客户端保留旧 base64 消息的读取能力。部署、恢复边界及清理见
+[双向文件通道](05-file-transfer.md)。
 
 **已知限制**：两个 thread 同时输出正文时会交错，只有状态消息能区分来源。
 forum topics 的 `message_thread_id` 才是这个问题的正解，但那是第二步。
@@ -223,6 +222,5 @@ socket 上变成 `[Errno 2]` —— 一次正常重启在聊天里刷出四条�
 - rpi 那张 mTLS 证书对应的用户需要对 exchange `agent` 有 `configure` 权限
   （已确认可以 declare，但 `rabbitmq-definitions.age` 是加密的，实际权限位未亲眼核对）
 - inbox 里的附件没有清理。thread 是软删的，它的附件目录会一直留着
-  （outbox 不在此列：文件发出即移走，一轮结束后目录是空的）
-- 发出去的文件其 base64 会连同事件落进 sqlite，等于同一份内容再存一遍。
-  10MB 上限下先这样，日志变胖再改成事件只带路径
+  （传输暂存文件保留 7 天；接收失败的 outbox 副本保留供用户处理）
+- 旧事件中的 base64 仍留在 sqlite；新文件事件只保存元数据，不迁移旧历史。

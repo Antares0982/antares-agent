@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +116,7 @@ async def make(tmp_path: Path) -> tuple[ThreadRunner, FakeClient]:
 
     r = ThreadRunner(
         thread_id="thr_1",
-        settings=Settings(workspace=tmp_path),
+        settings=Settings(workspace=tmp_path, db_path=tmp_path / "db.sqlite"),
         manifest=empty_manifest(tmp_path),
         profile=Profile(name="deep"),
         client_factory=factory,
@@ -338,7 +338,8 @@ async def test_outbox_files_go_out_once_and_leave_the_directory(
         files = [e for e in r.log.since(0) if e.type == EventType.FILE]
         assert len(files) == 1
         assert files[0].data["name"] == "report.md"
-        assert base64.b64decode(files[0].data["data_b64"]) == b"hello"
+        assert r.artifacts.path(files[0].data["artifact_id"]).read_bytes() == b"hello"
+        assert "data_b64" not in files[0].data
         assert not list(r.outbox.iterdir())
 
         await r.send("again")
@@ -349,12 +350,11 @@ async def test_outbox_files_go_out_once_and_leave_the_directory(
         await r.close()
 
 
-async def test_an_oversized_file_is_reported_and_still_removed(
+async def test_oversize_retention(
     tmp_path: Path, fast_settle: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Left in place it would be retried at the end of every turn, forever.
-    monkeypatch.setattr(runner_mod, "MAX_OUTBOX_BYTES", 4)
     r, client = await make(tmp_path)
+    r.settings = replace(r.settings, max_file_bytes=4)
     try:
         (r.outbox / "big.bin").write_bytes(b"12345")
         await r.send("go")
@@ -362,9 +362,9 @@ async def test_an_oversized_file_is_reported_and_still_removed(
         await settle()
 
         files = [e for e in r.log.since(0) if e.type == EventType.FILE]
-        assert [f.data["reason"] for f in files] == ["too_large"]
-        assert "data_b64" not in files[0].data
-        assert not list(r.outbox.iterdir())
+        assert not files
+        assert EventType.ERROR in kinds(r)
+        assert (r.outbox / "big.bin").exists()
     finally:
         await r.close()
 

@@ -113,6 +113,7 @@ class Settings:
     require_sandbox: bool = True
 
     extra_denied_tools: tuple[str, ...] = field(default_factory=tuple)
+    max_file_bytes: int = 2_000_000_000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -141,8 +142,13 @@ class Settings:
             event_buffer=_env_int("EVENT_BUFFER", 512),
             require_sandbox=_env_bool("REQUIRE_SANDBOX", True),
             extra_denied_tools=tuple(x for x in extra_deny.split(",") if x.strip()),
+            max_file_bytes=_env_int("MAX_FILE_BYTES", 2_000_000_000),
         )
 
     @property
     def manifest_path(self) -> Path:
         return self.workspace / "workspace.toml"
+
+    @property
+    def artifact_path(self) -> Path:
+        return self.db_path.parent / "artifacts"
