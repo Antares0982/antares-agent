@@ -5,6 +5,7 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -61,6 +62,11 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         async def set_permission_mode(self, mode: str) -> None:
             self.mode = mode
 
+        async def set_model(self, model: str) -> None:
+            if self.busy:
+                raise ValueError("会话正在执行")
+            self.persist_model(model)
+
         async def close(self) -> None: ...
 
     async def fake_runner(self: Any, thread_id: str) -> Any:
@@ -79,6 +85,7 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         event_log._next_id = self.store.last_event_id(thread_id) + 1
         self._logs[thread_id] = event_log
         runner = FakeRunner(thread_id, event_log)
+        runner.persist_model = lambda model: self.store.touch(thread_id, model=model)
         self._live[thread_id] = runner
         started.append(runner)
         return runner
@@ -114,6 +121,36 @@ def test_builtin_profiles_are_written_to_disk(client: TestClient, settings: Sett
 
 def test_unknown_profile_is_rejected(client: TestClient) -> None:
     assert client.post("/v1/threads", json={"profile": "nope"}).status_code == 400
+
+
+def test_model_selection(client: TestClient, settings: Settings, monkeypatch) -> None:
+    from antares_agent.runtime import ModelsUnavailable
+
+    models = [
+        {"id": "model-a", "name": "A", "is_default": True},
+        {"id": "model-b", "name": "B", "is_default": False},
+    ]
+    catalog = AsyncMock(return_value=models)
+    monkeypatch.setattr(client.app.state.manager.runtime, "models", catalog)
+    assert client.get("/v1/models").json() == {"models": models}
+    response = client.post("/v1/threads", json={"model": "model-b"})
+    assert response.status_code == 201
+    thread = response.json()["thread_id"]
+    assert response.json()["model"] == "model-b"
+    assert client.post("/v1/threads", json={"model": "typo"}).status_code == 400
+    assert client.post("/v1/threads", json={"model": ""}).status_code == 422
+    endpoint = f"/v1/threads/{thread}/model"
+    assert client.post(endpoint, json={"model": "typo"}).status_code == 400
+    assert client.post(endpoint, json={"model": None}).json()["model"] == "model-a"
+    client.started[-1].busy = True
+    assert client.post(endpoint, json={"model": "model-b"}).status_code == 409
+    assert client.get(f"/v1/threads/{thread}").json()["model"] == "model-a"
+    reopened = Store(settings.db_path)
+    assert reopened.get_thread(thread).model == "model-a"
+    reopened.close()
+    catalog.side_effect = ModelsUnavailable("模型列表暂不可用")
+    assert client.get("/v1/models").status_code == 503
+    assert client.post("/v1/threads", json={"model": "model-b"}).status_code == 503
 
 
 # --- threads -------------------------------------------------------------

@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import gitdiff, index
 from .artifacts import Artifacts, signature
@@ -35,6 +35,7 @@ class ThreadState:
     session_id: str | None = None
     summary: str = ""
     permission_mode: str = ""
+    model: str | None = None
 
 
 class ThreadRunner:
@@ -101,6 +102,13 @@ class ThreadRunner:
         self._pump = asyncio.create_task(self._run(text))
         return None
 
+    async def set_model(self, model: str):
+        if self.busy:
+            raise ValueError("会话正在执行，请结束或停止任务后再切换模型")
+        self.state.model = model
+        self.state.profile = replace(self.state.profile, model=model)
+        self.persist(self.state)
+
     async def _run(self, inputs):
         try:
             async with self.runtime.slots:
@@ -119,6 +127,8 @@ class ThreadRunner:
                         self.state.session_id, profile, self.state.permission_mode, instructions
                     )
                     self.state.session_id = session
+                    self.state.model = model
+                    self.state.profile = replace(profile, model=model)
                     if not self.state.summary:
                         text = (
                             inputs

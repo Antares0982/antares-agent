@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS threads (
     created_at     TEXT NOT NULL,
     last_active_at TEXT NOT NULL,
     permission_mode TEXT NOT NULL DEFAULT '',
+    model          TEXT,
     deleted        INTEGER NOT NULL DEFAULT 0
 );
 
@@ -60,6 +61,7 @@ class ThreadRow:
     created_at: str
     last_active_at: str
     permission_mode: str = ""
+    model: str | None = None
 
 
 class Store:
@@ -75,6 +77,8 @@ class Store:
             self._db.execute(
                 "ALTER TABLE threads ADD COLUMN permission_mode TEXT NOT NULL DEFAULT ''"
             )
+        if "model" not in columns:
+            self._db.execute("ALTER TABLE threads ADD COLUMN model TEXT")
         self._db.commit()
 
     def close(self) -> None:
@@ -151,6 +155,7 @@ class Store:
         session_id: str | None = None,
         summary: str = "",
         permission_mode: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Bump activity, and record whatever new identity the thread gained.
 
@@ -161,9 +166,10 @@ class Store:
             "UPDATE threads SET last_active_at = ?, "
             "session_id = COALESCE(?, session_id), "
             "summary = CASE WHEN summary = '' THEN ? ELSE summary END, "
-            "permission_mode = COALESCE(?, permission_mode) "
+            "permission_mode = COALESCE(?, permission_mode), "
+            "model = COALESCE(?, model) "
             "WHERE thread_id = ?",
-            (_now(), session_id, summary, permission_mode, thread_id),
+            (_now(), session_id, summary, permission_mode, model, thread_id),
         )
         self._db.commit()
 
@@ -226,4 +232,5 @@ def _row(row: sqlite3.Row) -> ThreadRow:
         created_at=row["created_at"],
         last_active_at=row["last_active_at"],
         permission_mode=row["permission_mode"],
+        model=row["model"],
     )

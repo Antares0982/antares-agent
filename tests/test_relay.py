@@ -301,6 +301,32 @@ async def test_new_thread_and_switch_publish_the_same_envelope() -> None:
     assert relay.published[0][1]["thread_id"] == "thr_a"
 
 
+async def test_model_commands() -> None:
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"models": [{"id": "model-a"}]})
+        return httpx.Response(200, json={"thread_id": "thr_a", "model": "model-a"})
+
+    relay = relay_over(handler)
+    await relay._dispatch({"op": "new_thread", "chat_id": "7", "model": "model-a"})
+    assert calls[0] == ("POST", "/v1/threads", {"model": "model-a"})
+    await relay._dispatch(
+        {"op": "models", "chat_id": "7", "thread_id": "thr_a", "select": "default"}
+    )
+    assert calls[-1] == ("POST", "/v1/threads/thr_a/model", {"model": None})
+    kind, payload = relay.published[-1]
+    assert kind == "relay.models"
+    assert payload["current"]["model"] == "model-a"
+    assert payload["select"] == "default"
+    await relay._dispatch({"op": "models", "chat_id": "7"})
+    assert relay.published[-1][1]["current"] is None
+    assert "select" not in relay.published[-1][1]
+
+
 async def test_list_passes_the_threads_through_untouched() -> None:
     threads = [
         {"thread_id": "thr_a", "summary": "a", "status": "idle"},

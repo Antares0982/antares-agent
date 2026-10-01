@@ -29,7 +29,8 @@ from . import profiles as profiles_mod
 from .artifacts import MAX_BYTES, descriptor
 from .config import Settings
 from .events import Event, EventType
-from .manager import Attachment, ThreadManager, UnknownProfile, UnknownThread
+from .manager import Attachment, ThreadManager, UnknownModel, UnknownProfile, UnknownThread
+from .runtime import ModelsUnavailable
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -37,7 +38,11 @@ log = logging.getLogger(__name__)
 MAX_ATTACHMENT_B64 = 28_000_000
 
 
-class NewThread(BaseModel):
+class ModelChange(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[\w./:-]+$")
+
+
+class NewThread(ModelChange):
     profile: str | None = None
 
 
@@ -146,14 +151,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         }
 
+    @app.get("/v1/models")
+    async def list_models(request: Request) -> dict[str, Any]:
+        try:
+            return {"models": await manager(request).runtime.models()}
+        except ModelsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+
     # -- threads ---------------------------------------------------------
 
     @app.post("/v1/threads", status_code=201)
     async def create_thread(body: NewThread, request: Request) -> dict[str, Any]:
         try:
-            row = await manager(request).create(body.profile)
+            row = await manager(request).create(body.profile, body.model)
         except UnknownProfile as exc:
             raise HTTPException(400, f"unknown profile: {exc.args[0]}") from exc
+        except UnknownModel as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ModelsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
         except index.DuplicateSkillError as exc:
             raise HTTPException(400, str(exc)) from exc
         return _thread_payload(row, manager(request))
@@ -308,6 +324,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "ok", "mode": body.mode}
 
+    @app.post("/v1/threads/{thread_id}/model")
+    async def set_model(thread_id: str, body: ModelChange, request: Request) -> dict[str, Any]:
+        mgr = manager(request)
+        try:
+            row = await mgr.set_model(thread_id, body.model)
+        except UnknownThread as exc:
+            raise HTTPException(404, "会话不存在") from exc
+        except UnknownModel as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ModelsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _thread_payload(row, mgr)
+
     # -- events ----------------------------------------------------------
 
     @app.get("/v1/threads/{thread_id}/events/replay")
@@ -378,6 +409,7 @@ def _thread_payload(row: Any, mgr: ThreadManager) -> dict[str, Any]:
     return {
         "thread_id": row.thread_id,
         "profile": row.profile,
+        "model": row.model,
         "summary": row.summary,
         "created_at": row.created_at,
         "last_active_at": row.last_active_at,

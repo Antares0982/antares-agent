@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 from antares_agent.config import Settings
 from antares_agent.events import Event, EventType
 from antares_agent.manager import ThreadManager
@@ -19,4 +21,32 @@ def test_recovery(tmp_path):
     assert store.get_thread("thr_a").permission_mode == "plan"
     assert store.events_since("thr_a", 1)[0]["payload"]["code"] == "interrupted"
     manager.artifacts.close()
+    store.close()
+
+
+async def test_model_recovery(tmp_path):
+    settings = Settings(
+        workspace=tmp_path, db_path=tmp_path / "db", profiles_dir=tmp_path / "profiles"
+    )
+    store = Store(settings.db_path)
+    store.create_thread("legacy", "quick")
+    store._db.execute("ALTER TABLE threads DROP COLUMN model")
+    store.close()
+    store = Store(settings.db_path)
+    assert store.get_thread("legacy").model is None
+    store.touch("legacy", session_id="codex-existing", model="model-a")
+    manager = ThreadManager(settings, store)
+    manager.runtime.models = AsyncMock(
+        return_value=[{"id": "model-a", "is_default": True}, {"id": "model-b", "is_default": False}]
+    )
+    await manager.set_model("legacy", "model-b")
+    assert store.get_thread("legacy").session_id == "codex-existing"
+    await manager.shutdown()
+    store.close()
+    store = Store(settings.db_path)
+    manager = ThreadManager(settings, store)
+    runner = await manager.runner("legacy")
+    assert runner.state.profile.model == "model-b"
+    assert runner.state.session_id == "codex-existing"
+    await manager.shutdown()
     store.close()

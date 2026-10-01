@@ -198,7 +198,31 @@ class Relay:
 
         if op == "new_thread":
             body = {"profile": cmd.get("profile")} if cmd.get("profile") else {}
+            if cmd.get("model") is not None:
+                body["model"] = cmd["model"]
             await self._bind(await self._post("/v1/threads", body), cmd.get("chat_id"))
+            return
+
+        if op == "models":
+            reply = await self._get("/v1/models")
+            current = None
+            if thread_id:
+                if "select" in cmd:
+                    current = await self._post(
+                        f"/v1/threads/{thread_id}/model",
+                        {"model": None if cmd["select"] == "default" else cmd["select"]},
+                    )
+                else:
+                    current = await self._get(f"/v1/threads/{thread_id}")
+            await self._publish(
+                "relay.models",
+                {
+                    "chat_id": cmd["chat_id"],
+                    "models": reply["models"],
+                    "current": current,
+                    **({"select": cmd["select"]} if "select" in cmd else {}),
+                },
+            )
             return
 
         if op == "list":

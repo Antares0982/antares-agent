@@ -12,7 +12,7 @@ import shutil
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import index
@@ -35,6 +35,10 @@ class UnknownThread(KeyError):
 
 
 class UnknownProfile(KeyError):
+    pass
+
+
+class UnknownModel(ValueError):
     pass
 
 
@@ -67,17 +71,46 @@ class ThreadManager:
 
     # -- lifecycle -------------------------------------------------------
 
-    async def create(self, profile_name: str | None = None) -> ThreadRow:
+    async def create(self, profile_name: str | None = None, model: str | None = None) -> ThreadRow:
         manifest = self.reload_manifest()
         name = profile_name or manifest.default_profile
         if name not in self.profiles:
             raise UnknownProfile(name)
+        if model is not None:
+            model = await self.select_model(model, name)
 
         index.write(manifest)
 
         thread_id = "thr_" + secrets.token_hex(6)
         self.store.create_thread(thread_id, name)
-        self.store.touch(thread_id, permission_mode=self.profiles[name].permission_mode)
+        self.store.touch(
+            thread_id,
+            permission_mode=self.profiles[name].permission_mode,
+            model=model or self.profiles[name].model,
+        )
+        row = self.store.get_thread(thread_id)
+        assert row is not None
+        return row
+
+    async def select_model(self, model: str | None, profile_name: str) -> str:
+        models = await self.runtime.models()
+        profile = self.profiles.get(profile_name) or Profile(profile_name)
+        selected = (
+            model
+            or profile.model
+            or next((item["id"] for item in models if item["is_default"]), None)
+        )
+        if selected not in {item["id"] for item in models}:
+            raise UnknownModel("模型不可用，请使用 /model 重新选择")
+        return selected
+
+    async def set_model(self, thread_id: str, model: str | None) -> ThreadRow:
+        row = self.store.get_thread(thread_id)
+        if row is None:
+            raise UnknownThread(thread_id)
+        selected = await self.select_model(model, row.profile)
+        runner = await self.runner(thread_id)
+        await runner.set_model(selected)
         row = self.store.get_thread(thread_id)
         assert row is not None
         return row
@@ -101,6 +134,8 @@ class ThreadManager:
             await self._evict_if_needed()
 
             profile = self.profiles.get(row.profile) or Profile(name=row.profile)
+            if row.model is not None:
+                profile = replace(profile, model=row.model)
             event_log = self._logs.get(thread_id)
             if event_log is None:
                 event_log = EventLog(
@@ -132,11 +167,13 @@ class ThreadManager:
                     session_id=state.session_id,
                     summary=state.summary,
                     permission_mode=state.permission_mode,
+                    model=state.model,
                 ),
             )
             runner.state.session_id = row.session_id
             runner.state.summary = row.summary
             runner.state.permission_mode = row.permission_mode
+            runner.state.model = row.model
             await runner.start(resume=row.session_id)
             self._live[thread_id] = runner
             return runner

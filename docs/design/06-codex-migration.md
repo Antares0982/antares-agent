@@ -17,6 +17,11 @@ CODEX_HOME/tmp/arg0 只读挂载为空目录，避免生成落在私有目录中
 现象。实际 CLI/app-server 沙箱、thread 创建、技能发现、资源读取、私有状态拒读以及
 认证 socket 无法连接均由启动自检验证，不允许忽略自检失败。
 
+RPi 的 agenix 隔离规则指向实际目录 `/run/agenix.d`，覆盖全部密钥版本；
+`/run/agenix` 是版本目录的符号链接，直接屏蔽该链接会导致 Codex 挂载失败。
+Antares 的 systemd `MemoryDenyWriteExecute` 关闭：真实模型工具调用和隔离对照均确认，
+该限制会使 Codex 的 V8 code-mode 宿主崩溃。此取舍经用户确认，目录隔离、沙箱与自动审批继续启用。
+
 ## 运行时
 
 Python SDK 与 CLI 均锁定 `openai-codex==0.159.2`。每个服务运行一个 app-server，
@@ -33,6 +38,18 @@ Antares 最多同时执行六个任务；同一会话后续消息排队。SQLite
 需要用户决定时，Agent 用普通中文消息提问并结束本轮。没有审批按钮或 request_user_input 界面。
 profile 在加载会话时确定；quick 使用 low/auto，deep 使用 high/plan，默认采用 runtime 模型。
 需要指定模型时，在新 profiles 目录的 TOML 中设置 `model`。
+
+Telegram `/model` 从 Codex 模型目录生成选择按钮，显示当前会话和后续新会话的模型。
+也支持 `/model <模型名>` 和 `/model default`。空闲会话直接切换，下条消息生效，
+保留原 thread 与上下文；执行中返回 409，不改变当前或后续选择。没有会话时只设置后续选择。
+Alice 按聊天持久化选择，普通消息、附件和 `/new` 创建会话时均传入该模型。
+线程数据库保存模型，首次运行记录 Codex 实际选中的模型，重启和恢复后继续使用它。
+已加载线程的 `thread/resume` 返回旧模型；切换通过下一轮 `turn/start.model` 与
+collaboration mode 的模型设置共同生效，不能依赖 resume 覆盖模型。
+`/model default` 恢复 profile 指定模型或 Codex 默认模型，后续新会话恢复跟随 profile。
+
+对应接口：`GET /v1/models` 返回可选目录，`POST /v1/threads` 接受可选 `model`，
+`POST /v1/threads/{thread_id}/model` 接受 `model`（null 表示默认），线程详情返回 `model`。
 
 根 `turn/completed` 结束一轮。子 Agent 的派遣与完成通过原生 collab 事件显示，编排提示词
 要求汇总前等待子任务；不模拟 Claude 的后台完成后自动续跑。中断会清空队列；进程崩溃和

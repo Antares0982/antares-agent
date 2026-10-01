@@ -24,7 +24,8 @@ class FakeRuntime:
         pass
 
     async def prepare(self, session, profile, mode, instructions):
-        return session or "codex-session", "fixture-model"
+        self.prepared_model = profile.model
+        return session or "codex-session", profile.model or "fixture-model"
 
     async def turn(self, session, inputs, mode, profile, model, manifest):
         self.sent.append((inputs, mode))
@@ -93,6 +94,27 @@ async def test_queue_and_resume(tmp_path):
     await runner.set_permission_mode("plan")
     assert runner.state.permission_mode == "plan"
     assert runtime.released == ["codex-session", "codex-session"]
+    await runner.close()
+
+
+async def test_model_switch(tmp_path):
+    runner, runtime, _ = await make(tmp_path)
+    await runner.start(resume="existing-session")
+    await runner.set_model("model-a")
+    await runner.send("first")
+    with pytest.raises(ValueError, match="正在执行"):
+        await runner.set_model("model-b")
+    await wait_for(lambda: bool(runtime.sent))
+    assert runtime.prepared_model == "model-a"
+    runtime.finish()
+    await runner._pump
+    await runner.set_model("model-b")
+    await runner.send("second")
+    await wait_for(lambda: len(runtime.sent) == 2)
+    assert runtime.prepared_model == "model-b"
+    assert runner.state.session_id == "existing-session"
+    runtime.finish()
+    await runner._pump
     await runner.close()
 
 

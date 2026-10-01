@@ -7,6 +7,7 @@ import shutil
 
 from openai_codex.client import CodexClient, CodexConfig
 from openai_codex.generated.v2_all import (
+    ModelListResponse,
     SkillsExtraRootsSetResponse,
     SkillsListResponse,
     ThreadUnsubscribeResponse,
@@ -16,6 +17,10 @@ from .auth import TokenClient
 from .config import Settings
 
 log = logging.getLogger(__name__)
+
+
+class ModelsUnavailable(RuntimeError):
+    pass
 
 
 def prepare_home(settings):
@@ -116,6 +121,33 @@ class Runtime:
         except Exception:
             log.warning("Codex notification stream closed")
 
+    async def models(self):
+        try:
+            client = await self.start()
+            models = []
+            cursor = None
+            while True:
+                page = await asyncio.to_thread(
+                    client.request,
+                    "model/list",
+                    {"includeHidden": False, "cursor": cursor},
+                    response_model=ModelListResponse,
+                )
+                models.extend(
+                    {
+                        "id": item.model,
+                        "name": item.display_name,
+                        "is_default": item.is_default,
+                    }
+                    for item in page.data
+                    if not item.hidden
+                )
+                cursor = page.next_cursor
+                if cursor is None:
+                    return models
+        except Exception as exc:
+            raise ModelsUnavailable("模型列表暂不可用，请稍后重试") from exc
+
     async def skills(self, manifest):
         client = await self.start()
         roots = self.skill_paths(manifest)
@@ -169,12 +201,13 @@ class Runtime:
         if result.approvals_reviewer.value != "auto_review":
             raise RuntimeError("Codex 自动审批未生效")
         self.default_model = result.model
-        return result.thread.id, result.model
+        return result.thread.id, profile.model or result.model
 
     async def turn(self, session, inputs, mode, profile, model, manifest):
         client = await self.start()
         self.usage.pop(session, None)
         options = {
+            "model": model,
             "approvalPolicy": "on-request",
             "approvalsReviewer": "auto_review",
             "sandboxPolicy": self.sandbox(mode, manifest),

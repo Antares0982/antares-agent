@@ -58,6 +58,37 @@ def test_runtime_contract(tmp_path):
             {"type": "chatgptAuthTokens", "accessToken": token, "chatgptAccountId": "fixture"}
         )
         assert auth.read_text() == legacy
+        models = client.model_list().data
+        assert len(models) >= 2
+        options = {
+            "cwd": str(work),
+            "model": models[0].model,
+            "config": {
+                "model_provider": "fixture",
+                "model_providers.fixture": {
+                    "name": "fixture",
+                    "base_url": "http://127.0.0.1:1",
+                    "wire_api": "responses",
+                    "request_max_retries": 0,
+                    "stream_max_retries": 0,
+                },
+            },
+        }
+        started = client.thread_start(options)
+        turn = client.turn_start(started.thread.id, [{"type": "text", "text": "fixture"}])
+        while client.next_turn_notification(turn.turn.id).method != "turn/completed":
+            pass
+        resumed = client.thread_resume(started.thread.id, {**options, "model": models[1].model})
+        assert resumed.thread.id == started.thread.id
+        turn = client.turn_start(
+            resumed.thread.id,
+            [{"type": "text", "text": "fixture switch"}],
+            {"model": models[1].model},
+        )
+        while client.next_turn_notification(turn.turn.id).method != "turn/completed":
+            pass
+        resumed = client.thread_resume(started.thread.id, options)
+        assert resumed.model == models[1].model
         skills = work / ".agents/skills"
         skills.mkdir(parents=True)
         client.request(

@@ -18,11 +18,22 @@ async def test_forced_policy(tmp_path):
     calls = []
 
     class Client:
+        def thread_resume(self, session, options):
+            return SimpleNamespace(
+                thread=SimpleNamespace(id=session),
+                model="previous-model",
+                approvals_reviewer=SimpleNamespace(value="auto_review"),
+            )
+
         def turn_start(self, session, inputs, options):
             calls.append(options)
             return SimpleNamespace(turn=SimpleNamespace(id="turn"))
 
     runtime.client = Client()
+    session, model = await runtime.prepare(
+        "thread", Profile("quick", model="fixture-model"), "auto", ""
+    )
+    assert (session, model) == ("thread", "fixture-model")
     for mode in ("plan", "auto"):
         await runtime.turn(
             "thread", "hello", mode, Profile("quick"), "fixture-model", empty(tmp_path)
@@ -34,7 +45,36 @@ async def test_forced_policy(tmp_path):
     assert calls[0]["sandboxPolicy"]["type"] == "readOnly"
     assert calls[0]["collaborationMode"]["mode"] == "plan"
     assert calls[1]["sandboxPolicy"]["networkAccess"]
+    assert calls[1]["model"] == "fixture-model"
     assert str(tmp_path / ".agents/skills") in calls[1]["sandboxPolicy"]["writableRoots"]
+
+
+async def test_model_catalog(tmp_path):
+    runtime = Runtime(Settings(workspace=tmp_path))
+    calls = []
+
+    class Client:
+        def request(self, method, params, response_model):
+            calls.append(params)
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        model="model-b" if params["cursor"] else "model-a",
+                        display_name="Model",
+                        is_default=not params["cursor"],
+                        hidden=False,
+                    ),
+                    SimpleNamespace(hidden=True),
+                ],
+                next_cursor=None if params["cursor"] else "page-2",
+            )
+
+    runtime.client = Client()
+    assert [m["id"] for m in await runtime.models()] == ["model-a", "model-b"]
+    assert calls == [
+        {"includeHidden": False, "cursor": None},
+        {"includeHidden": False, "cursor": "page-2"},
+    ]
 
 
 def test_resource_layout(tmp_path):
