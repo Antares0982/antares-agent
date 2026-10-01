@@ -21,8 +21,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="run the startup self-check and exit (see F23: the sandbox fails open)",
+        help="run the Codex sandbox self-check and exit",
     )
+    parser.add_argument(
+        "--migrate-workspace", action="store_true", help="preview native skill migration"
+    )
+    parser.add_argument("--apply", action="store_true", help="apply migration with backups")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -31,6 +35,21 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     settings = Settings.from_env()
+
+    if args.apply and not args.migrate_workspace:
+        parser.error("--apply requires --migrate-workspace")
+    if args.migrate_workspace:
+        from .migrate import migrate
+
+        try:
+            moves, backup = migrate(settings.workspace, args.apply)
+        except (OSError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        for source, target in moves:
+            print(f"{source} → {target}")
+        print(f"备份：{backup}" if backup else "预览完成；使用 --apply 执行迁移")
+        return 0
 
     if args.check:
         try:
@@ -47,9 +66,6 @@ def main(argv: list[str] | None = None) -> int:
     from .api import create_app
 
     app = create_app(settings)
-    # A socket, when configured, replaces the TCP listener rather than
-    # supplementing it -- leaving the port open would keep the exposure the
-    # socket exists to remove. --host/--port force TCP back on for development.
     if settings.socket_path is not None and not (args.host or args.port):
         uvicorn.run(app, uds=str(settings.socket_path), log_level=args.log_level)
     else:

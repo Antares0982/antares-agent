@@ -227,31 +227,10 @@ async def test_resume_replays_from_sqlite_without_following_an_idle_thread() -> 
     assert relay._followers == {}
 
 
-async def test_an_evicted_thread_reports_409_rather_than_failing_silently() -> None:
-    # The bot has to be able to tell the user why the button did nothing.
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(409, json={"detail": "thread is not running"})
-
-    relay = relay_over(handler)
-
-    class FakeIncoming:
-        body = json.dumps(
-            {"op": "approve", "thread_id": "thr_x", "approval_id": "apr_1", "decision": "allow"}
-        ).encode()
-
-        def process(self, requeue: bool = True) -> Any:
-            class Ctx:
-                async def __aenter__(self) -> None: ...
-                async def __aexit__(self, *exc: Any) -> None: ...
-
-            return Ctx()
-
-    await relay._on_command(FakeIncoming())  # type: ignore[arg-type]
-
-    assert len(relay.published) == 1
-    type_, payload = relay.published[0]
-    assert type_ == "relay.cmd_failed"
-    assert payload["op"] == "approve" and "409" in payload["detail"]
+async def test_approval_op_removed() -> None:
+    relay = relay_over(lambda request: httpx.Response(200))
+    with pytest.raises(ValueError, match="unknown op"):
+        await relay._dispatch({"op": "approve", "thread_id": "thr_x"})
 
 
 async def test_message_posts_then_follows() -> None:

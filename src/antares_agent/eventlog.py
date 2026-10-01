@@ -1,11 +1,4 @@
-"""Per-thread event sequence, with replay.
-
-`GET /events?after=<id>` is served from here rather than by having the client
-open a stream and then reconcile it against a history fetch. The simpler
-protocol is also the safer one: the reconcile version drops an
-`approval.required` that lands during the gap, and the thread then sits in
-`awaiting_approval` forever with nobody able to answer it.
-"""
+"""Per-thread event sequence with durable replay."""
 
 from __future__ import annotations
 

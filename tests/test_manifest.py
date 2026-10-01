@@ -138,7 +138,7 @@ def test_repo_for_path_picks_longest_prefix(tmp_path: Path) -> None:
 
 
 def _skill(root: Path, repo: str, name: str, desc: str) -> None:
-    d = root / repo / ".claude" / "skills" / name
+    d = root / repo / ".agents" / "skills" / name
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text(
         f"---\nname: {name}\ndescription: {desc}\n---\n\nbody\n", encoding="utf-8"
@@ -171,16 +171,16 @@ def test_write_creates_index_and_pointer(tmp_path: Path) -> None:
     target = index.write(m)
     assert target == tmp_path / ".agent" / "workspace-index.md"
     assert "# 工作区索引" in target.read_text(encoding="utf-8")
-    assert index.POINTER in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert index.POINTER in (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
 
 
 def test_pointer_is_idempotent_and_preserves_user_content(tmp_path: Path) -> None:
     _workspace(tmp_path, GOOD)
-    (tmp_path / "CLAUDE.md").write_text("# 我的说明\n\n手写内容。\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("# 我的说明\n\n手写内容。\n", encoding="utf-8")
 
     index.ensure_pointer(tmp_path)
     index.ensure_pointer(tmp_path)
-    text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    text = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
 
     assert text.count(index.POINTER) == 1
     assert "手写内容。" in text
@@ -196,3 +196,8 @@ def test_frontmatter_block_scalars(tmp_path: Path) -> None:
     meta = index._frontmatter(d / "SKILL.md")
     assert meta["name"] == "quoted-name"
     assert meta["description"] == "first line second line"
+
+
+def test_scratch_escape(tmp_path):
+    with pytest.raises(manifest.ManifestError):
+        manifest.parse({"workspace": {"scratch": "../outside"}}, tmp_path)

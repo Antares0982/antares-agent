@@ -1,3 +1,5 @@
+> 历史记录：Claude SDK 实现。当前运行时与协议差异见 [Codex 迁移](06-codex-migration.md)。
+
 # antares-agent — 架构与决策记录
 
 > 状态：**定稿**。全部设计前置假设已实测，其中六条被推翻并已改设计（见 `03-verification.md` 头部）。

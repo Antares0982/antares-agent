@@ -26,7 +26,6 @@ from starlette.background import BackgroundTask
 
 from . import index, preflight
 from . import profiles as profiles_mod
-from .approvals import UnknownApproval
 from .artifacts import MAX_BYTES, descriptor
 from .config import Settings
 from .events import Event, EventType
@@ -35,10 +34,6 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
-#: Ceiling on one base64-encoded attachment. Telegram will not hand a bot
-#: anything past 20MB, and this is the room that takes; the number matters
-#: only because an unbounded string here is a memory bomb in a process that
-#: is already holding several CLI sessions (V4).
 MAX_ATTACHMENT_B64 = 28_000_000
 
 
@@ -72,21 +67,13 @@ class NewMessage(BaseModel):
 
     @model_validator(mode="after")
     def _not_empty(self) -> NewMessage:
-        # `text` alone can no longer carry this: a photo with no caption is a
-        # perfectly good message, and an empty one is still not.
         if not self.text.strip() and not self.attachments:
             raise ValueError("需要 text 或 attachments")
         return self
 
 
-class Approval(BaseModel):
-    approval_id: str
-    decision: Literal["allow", "deny"]
-    message: str = ""
-
-
 class ModeChange(BaseModel):
-    mode: Literal["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]
+    mode: Literal["plan", "auto"]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -94,8 +81,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-        # F23: the sandbox fails open when bwrap or socat is missing, so this
-        # has to run before anything can accept a request.
         preflight.run(settings)
         profiles_mod.materialise(settings)
         store = Store(settings.db_path)
@@ -105,8 +90,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Before the first request, so a client that reconnects immediately
         # reads the correction rather than the crash's last word.
         app.state.manager.recover()
-        # An idle CLI is not a parked one: it spins a core until it is closed
-        # (F31), so idleness has to be evicted on, not just pool pressure.
         reaper = asyncio.create_task(app.state.manager.reap_forever(), name="idle-reaper")
 
         async def clean_files() -> None:
@@ -172,8 +155,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except UnknownProfile as exc:
             raise HTTPException(400, f"unknown profile: {exc.args[0]}") from exc
         except index.DuplicateSkillError as exc:
-            # F2: shadowed skills cannot be disambiguated, so refuse to open a
-            # thread that would silently run the wrong one.
             raise HTTPException(400, str(exc)) from exc
         return _thread_payload(row, manager(request))
 
@@ -306,20 +287,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mgr.store.finish_request(body.request_id, result)
         return result
 
-    @app.post("/v1/threads/{thread_id}/approve")
-    async def approve(thread_id: str, body: Approval, request: Request) -> dict[str, str]:
-        mgr = manager(request)
-        if not mgr.is_live(thread_id):
-            raise HTTPException(409, "thread is not running; the approval no longer exists")
-        runner = await mgr.runner(thread_id)
-        try:
-            runner.resolve_approval(
-                body.approval_id, allow=body.decision == "allow", message=body.message
-            )
-        except UnknownApproval as exc:
-            raise HTTPException(404, "unknown or already-resolved approval") from exc
-        return {"status": "accepted"}
-
     @app.post("/v1/threads/{thread_id}/interrupt")
     async def interrupt(thread_id: str, request: Request) -> dict[str, str]:
         mgr = manager(request)
@@ -331,13 +298,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/threads/{thread_id}/mode")
     async def set_mode(thread_id: str, body: ModeChange, request: Request) -> dict[str, str]:
-        # Hot, unlike the profile: permission mode never enters a model
-        # request, so switching costs no cache (D7).
         try:
             runner = await manager(request).runner(thread_id)
         except UnknownThread as exc:
             raise HTTPException(404, "unknown thread") from exc
-        await runner.set_permission_mode(body.mode)
+        try:
+            await runner.set_permission_mode(body.mode)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"status": "ok", "mode": body.mode}
 
     # -- events ----------------------------------------------------------
@@ -415,6 +383,6 @@ def _thread_payload(row: Any, mgr: ThreadManager) -> dict[str, Any]:
         "last_active_at": row.last_active_at,
         "status": str(mgr.status(row.thread_id)),
         "background_agents": len(runner.translator.background_tasks) if runner else 0,
-        "pending_approvals": len(runner.approvals.pending) if runner else 0,
+        "permission_mode": runner.state.permission_mode if runner else row.permission_mode,
         "last_event_id": mgr.store.last_event_id(row.thread_id),
     }

@@ -1,3 +1,5 @@
+> 历史记录：Claude SDK 实现。当前运行时与协议差异见 [Codex 迁移](06-codex-migration.md)。
+
 # Telegram 接入
 
 > 状态：**设计定稿，实现中**。本文记录传输与协议形态的选择理由；

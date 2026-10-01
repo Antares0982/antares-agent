@@ -1,14 +1,4 @@
-"""`workspace.toml` -- what repos exist and how they constrain each other.
-
-The manifest deliberately does *not* register capabilities. Skills and
-CLAUDE.md under a repo are discovered lazily the moment the agent touches that
-subtree (F1/F4), so listing them here would only pay their context cost up
-front. What the SDK cannot supply at all is the cross-repo picture: a subagent
-receives nothing but the Agent tool's prompt string, so `[[relation]]` is the
-one thing that has to be written down.
-
-See docs/design/01-workspace-manifest.md.
-"""
+"""Workspace repository boundaries and dependencies."""
 
 from __future__ import annotations
 
@@ -109,6 +99,10 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
     problems: list[str] = []
     ws = raw.get("workspace") or {}
 
+    scratch = str(ws.get("scratch", ".agent"))
+    if error := _check_contained(scratch, root, where="workspace.scratch"):
+        problems.append(error)
+
     repos: list[Repo] = []
     seen: set[str] = set()
     for i, entry in enumerate(raw.get("repo") or []):
@@ -185,7 +179,7 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
 
     return Manifest(
         root=root,
-        scratch=str(ws.get("scratch", ".agent")),
+        scratch=scratch,
         default_profile=str(ws.get("default_profile", "quick")),
         repos=tuple(repos),
         relations=tuple(relations),
@@ -193,12 +187,6 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
 
 
 def _check_contained(rel: str, root: Path, *, where: str) -> str | None:
-    """D2: everything the agent works on must live under the workspace root.
-
-    Not a security boundary -- the sandbox is -- but a path outside the root
-    silently loses lazy skill discovery and hierarchical CLAUDE.md, so it is
-    worth refusing loudly.
-    """
     if Path(rel).is_absolute():
         return f"{where}: {rel!r} must be relative to the workspace root"
     resolved = (root / rel).resolve()

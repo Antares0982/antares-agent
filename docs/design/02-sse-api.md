@@ -1,3 +1,5 @@
+> 历史记录：Claude SDK 实现。当前运行时与协议差异见 [Codex 迁移](06-codex-migration.md)。
+
 # SSE + HTTP API
 
 对外接口。目标：**任何 IM 适配器都是薄客户端** —— 分组、折叠、渲染策略由服务端提供足够信息，客户端不需要理解 Agent SDK 的语义。

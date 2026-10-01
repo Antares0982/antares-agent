@@ -1,17 +1,3 @@
-"""End-to-end against the real CLI. Skipped unless explicitly enabled.
-
-Everything else in this suite fakes the SDK client, which means it verifies
-our logic and nothing about whether the options we pass are the options the
-CLI accepts. This test drives an actual turn: real permission arbitration,
-real message stream, real diff.
-
-    ANTARES_LIVE=1 \
-    ANTARES_LIVE_KEY_FILE=~/configs/deepseek_api_key.txt \
-    ANTARES_LIVE_BASE_URL=https://api.deepseek.com/anthropic \
-    ANTARES_LIVE_MODEL=deepseek-v4-flash \
-    pytest tests/test_live.py -v
-"""
-
 from __future__ import annotations
 
 import json
@@ -40,20 +26,12 @@ pytestmark = pytest.mark.skipif(
 TIMEOUT_S = 240
 
 
-def _key() -> str:
-    raw = os.environ.get("ANTARES_LIVE_KEY_FILE")
-    if raw:
-        return Path(raw).expanduser().read_text().strip()
-    return os.environ.get("ANTARES_LIVE_KEY", "")
-
-
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     root = tmp_path / "agent_work"
     repo = root / "api"
     repo.mkdir(parents=True)
     (repo / "notes.md").write_text("# Notes\n\nnothing yet\n", encoding="utf-8")
-    # gpgsign off: a global signing config would want a tty we do not have.
     identity = [
         "-c",
         "user.email=t@e.st",
@@ -89,22 +67,12 @@ def client(
     an SSE stream that never ends simply hangs. Since streaming *is* the thing
     under test here, it has to go over a socket.
     """
-    for name in list(os.environ):
-        if name.startswith("CLAUDE_CODE") or name in {
-            "CLAUDECODE",
-            "CLAUDE_PID",
-            "CLAUDE_EFFORT",
-            "AI_AGENT",
-        }:
-            monkeypatch.delenv(name, raising=False)
-
     settings = Settings(
         workspace=workspace,
         db_path=tmp_path / "antares.db",
         profiles_dir=tmp_path / "profiles",
-        cli_path=Path(os.environ.get("ANTARES_LIVE_CLI", "/run/current-system/sw/bin/claude")),
-        gateway_base_url=os.environ.get("ANTARES_LIVE_BASE_URL") or None,
-        gateway_auth_token=_key() or None,
+        codex_home=tmp_path / "codex",
+        auth_socket=Path(os.environ["ANTARES_LIVE_AUTH_SOCKET"]),
         require_sandbox=True,
     )
     app = create_app(settings)
@@ -127,7 +95,7 @@ def client(
 
     model = os.environ.get("ANTARES_LIVE_MODEL")
     app.state.manager.profiles["quick"] = Profile(
-        name="quick", permission_mode="acceptEdits", effort="low", model=model
+        name="quick", permission_mode="auto", effort="low", model=model
     )
 
     with httpx.Client(base_url=base, timeout=TIMEOUT_S) as c:
@@ -157,9 +125,8 @@ def drain(client: httpx.Client, thread_id: str, until: str) -> list[dict[str, An
 def test_a_real_turn_edits_a_file_and_reports_a_diff(client: httpx.Client, workspace: Path) -> None:
     thread_id = client.post("/v1/threads", json={"profile": "quick"}).json()["thread_id"]
 
-    # The index helper must have produced its file and the CLAUDE.md pointer.
     assert (workspace / ".agent" / "workspace-index.md").exists()
-    assert "workspace-index.md" in (workspace / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "workspace-index.md" in (workspace / "AGENTS.md").read_text(encoding="utf-8")
 
     client.post(
         f"/v1/threads/{thread_id}/messages",
@@ -179,11 +146,9 @@ def test_a_real_turn_edits_a_file_and_reports_a_diff(client: httpx.Client, works
     assert "notes.md" in diffs[-1]["patch"]
 
     done = [f["payload"] for f in frames if f["type"] == "turn.done"][-1]
-    # F15: cost is priced against the Anthropic rate card regardless of endpoint.
-    assert done["cost_trusted"] is (os.environ.get("ANTARES_LIVE_BASE_URL") is None)
+    assert "cost_usd" not in done
     assert done["usage"]
 
-    # Sandboxed work must not have produced an approval prompt (D3).
     assert "approval.required" not in kinds
 
 
@@ -196,9 +161,10 @@ def test_sandboxed_reads_are_silent_but_still_reported(client: httpx.Client) -> 
     frames = drain(client, thread_id, until="idle")
 
     bash = [
-        f["payload"] for f in frames if f["type"] == "tool.call" and f["payload"]["tool"] == "Bash"
+        f["payload"]
+        for f in frames
+        if f["type"] == "tool.call" and f["payload"]["tool"] == "commandExecution"
     ]
     assert bash, [f["type"] for f in frames]
-    assert bash[0]["sandboxed"] is True
     assert bash[0]["render"] == "summary"
     assert "approval.required" not in [f["type"] for f in frames]

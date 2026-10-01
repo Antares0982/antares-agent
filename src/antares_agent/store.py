@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS threads (
     summary        TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL,
     last_active_at TEXT NOT NULL,
+    permission_mode TEXT NOT NULL DEFAULT '',
     deleted        INTEGER NOT NULL DEFAULT 0
 );
 
@@ -58,6 +59,7 @@ class ThreadRow:
     summary: str
     created_at: str
     last_active_at: str
+    permission_mode: str = ""
 
 
 class Store:
@@ -68,6 +70,11 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(threads)")}
+        if "permission_mode" not in columns:
+            self._db.execute(
+                "ALTER TABLE threads ADD COLUMN permission_mode TEXT NOT NULL DEFAULT ''"
+            )
         self._db.commit()
 
     def close(self) -> None:
@@ -137,7 +144,14 @@ class Store:
         ).fetchall()
         return [_row(r) for r in rows]
 
-    def touch(self, thread_id: str, *, session_id: str | None = None, summary: str = "") -> None:
+    def touch(
+        self,
+        thread_id: str,
+        *,
+        session_id: str | None = None,
+        summary: str = "",
+        permission_mode: str | None = None,
+    ) -> None:
         """Bump activity, and record whatever new identity the thread gained.
 
         `session_id` and `summary` only ever move from unset to set, so a
@@ -146,9 +160,10 @@ class Store:
         self._db.execute(
             "UPDATE threads SET last_active_at = ?, "
             "session_id = COALESCE(?, session_id), "
-            "summary = CASE WHEN summary = '' THEN ? ELSE summary END "
+            "summary = CASE WHEN summary = '' THEN ? ELSE summary END, "
+            "permission_mode = COALESCE(?, permission_mode) "
             "WHERE thread_id = ?",
-            (_now(), session_id, summary, thread_id),
+            (_now(), session_id, summary, permission_mode, thread_id),
         )
         self._db.commit()
 
@@ -195,33 +210,6 @@ class Store:
         ).fetchone()
         return json.loads(row["payload"]).get("status") if row else None
 
-    def unanswered_approvals(self, thread_id: str) -> list[str]:
-        """Approvals that were asked and never resolved.
-
-        Read at startup this means one thing only: the process died holding
-        them. Answering the question from our own log rather than from the
-        CLI's session file keeps it inside data we write ourselves -- the
-        marker the CLI leaves behind (V1) says the same thing, but only via a
-        path convention and a file format that are nobody's published API.
-        """
-        rows = self._db.execute(
-            "SELECT type, payload FROM events WHERE thread_id = ? AND type IN (?, ?) "
-            "ORDER BY event_id",
-            (thread_id, str(EventType.APPROVAL_REQUIRED), str(EventType.APPROVAL_RESOLVED)),
-        ).fetchall()
-        # dict rather than set: the order the user was asked in is the order
-        # worth reporting back, and there are never many.
-        waiting: dict[str, None] = {}
-        for row in rows:
-            approval_id = json.loads(row["payload"]).get("approval_id")
-            if approval_id is None:
-                continue
-            if row["type"] == str(EventType.APPROVAL_REQUIRED):
-                waiting[approval_id] = None
-            else:
-                waiting.pop(approval_id, None)
-        return list(waiting)
-
     def last_event_id(self, thread_id: str) -> int:
         row = self._db.execute(
             "SELECT MAX(event_id) AS m FROM events WHERE thread_id = ?", (thread_id,)
@@ -237,4 +225,5 @@ def _row(row: sqlite3.Row) -> ThreadRow:
         summary=row["summary"],
         created_at=row["created_at"],
         last_active_at=row["last_active_at"],
+        permission_mode=row["permission_mode"],
     )

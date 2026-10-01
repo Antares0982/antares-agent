@@ -1,3 +1,5 @@
+> 历史记录：Claude SDK 实现。当前运行时与协议差异见 [Codex 迁移](06-codex-migration.md)。
+
 # Workspace Manifest 与索引 helper
 
 `~/agent_work/workspace.toml` —— 描述工作区里有哪些仓库、它们之间是什么关系。

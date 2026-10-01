@@ -1,21 +1,3 @@
-"""Profiles: the cold half of a thread's configuration.
-
-A profile is fixed when the thread is created and never changes (D6). The
-system prompt sits in the cache prefix, so editing it mid-thread invalidates
-both the system and message layers; `/new deep` is cheaper and clearer than
-switching. Permission mode is the exception -- it never reaches the model, so
-it stays hot (D7).
-
-The orchestration text lives in a file rather than a string constant because
-it is the asset that will be edited most often, and because it needs to be
-tunable per provider: F26 found sonnet holds back from fanning out where
-deepseek-v4-pro reaches for it eagerly.
-
-Profiles carry no repo list. Capabilities are discovered lazily (F1) and the
-repo picture comes from the index file, so one profile works for any
-workspace and adding a repo never touches profile config (D9).
-"""
-
 from __future__ import annotations
 
 import logging
@@ -27,45 +9,31 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-PermissionMode = Literal["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"]
+PermissionMode = Literal["plan", "auto"]
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
-ORCHESTRATION = """\
-你是多仓库工作区的编排者。
-
-按 **上下文体积 × 耦合度** 切分任务，而不是按仓库边界：
-
-- 调研阶段体积大、耦合低 → 用 Agent 工具并行扇出，每个仓库一个 `Explore`，
-  在 prompt 里点名该仓库的路径
-- 定契约阶段体积小、耦合极高 → 你自己做，不要外包
-- 修改阶段 → 契约写进 `.agent/contract.md` 之后才可并行
-- 验证阶段 → 用未参与修改的新鲜上下文
-
-交接一律用文件，不要用散文复述：调研 agent 写 `.agent/findings-<repo>.md`，
-你综合成 `.agent/contract.md`，修改 agent 只需被指向该文件的相应章节。
-subagent 拿不到你的对话历史，只能拿到 Agent 工具的 prompt 字符串。
-
-**任务小就自己做。** 只涉及一个仓库、或改动不超过几个文件时，扇出的成本高于收益。
+ORCHESTRATION = """你是多仓库工作区的编排者。
+先读取工作区索引及相关仓库的 AGENTS.md。
+复杂任务先调研、明确契约，再修改和验证；小任务直接完成。
+可以派遣子 Agent；汇总前必须等待子任务完成。
+需要用户决定时用普通中文消息提问并结束本轮，等用户回复后继续。
+新技能写到工作区或仓库的 .agents/skills/<name>/SKILL.md。
 """
 
 _BUILTIN: dict[str, dict[str, Any]] = {
     "quick": {
-        "description": "日常小改动。不扇出，直接改。",
-        "permission_mode": "acceptEdits",
-        # Tier alias, not a provider model id: ANTARES_MODEL_* maps it at the
-        # CLI, so a profile stays valid whichever endpoint is behind it.
-        "model": "sonnet",
+        "description": "日常小改动，直接执行。",
+        "permission_mode": "auto",
+        "model": None,
         "effort": "low",
         "append": "",
     },
     "deep": {
         "description": "跨仓库任务。先出计划，再动手。",
         "permission_mode": "plan",
-        # F26: flash barely fans out on its own, so orchestration needs the
-        # top tier.
-        "model": "opus",
+        "model": None,
         "effort": "high",
-        "append": ORCHESTRATION,
+        "append": "",
     },
 }
 
@@ -74,12 +42,10 @@ _BUILTIN: dict[str, dict[str, Any]] = {
 class Profile:
     name: str
     description: str = ""
-    #: Appended to the `claude_code` preset, never replacing it.
     append: str = ""
-    permission_mode: PermissionMode = "acceptEdits"
+    permission_mode: PermissionMode = "auto"
     model: str | None = None
     effort: Effort | None = None
-    max_turns: int | None = None
 
 
 def materialise(settings: Settings) -> None:
@@ -93,7 +59,6 @@ def materialise(settings: Settings) -> None:
         lines = [
             f'description = "{spec["description"]}"',
             f'permission_mode = "{spec["permission_mode"]}"',
-            f'model = "{spec["model"]}"',
             f'effort = "{spec["effort"]}"',
         ]
         if spec["append"]:
@@ -119,11 +84,6 @@ def load(settings: Settings) -> dict[str, Profile]:
             log.error("ignoring profile %s: %s", path, exc)
             continue
 
-        # Merged over the built-in, not substituted for it. `materialise`
-        # never rewrites a file that already exists, so a profile written by
-        # an older version is missing every key added since -- and a missing
-        # `model` is invisible: the CLI silently falls back to its default
-        # tier, which is opus, so `quick` ran on the expensive model.
         base = profiles.get(name) or Profile(name=name)
 
         append = base.append
@@ -137,14 +97,16 @@ def load(settings: Settings) -> dict[str, Profile]:
         elif "append" in raw:
             append = str(raw["append"])
 
+        mode = raw.get("permission_mode", base.permission_mode)
+        if mode not in {"plan", "auto"}:
+            raise ValueError(f"{path}: 模式必须是 plan 或 auto，请迁移旧 profile")
         profiles[name] = Profile(
             name=name,
             description=str(raw.get("description", base.description)),
             append=append,
-            permission_mode=raw.get("permission_mode", base.permission_mode),
+            permission_mode=mode,
             model=raw.get("model", base.model),
             effort=raw.get("effort", base.effort),
-            max_turns=raw.get("max_turns", base.max_turns),
         )
     return profiles
 

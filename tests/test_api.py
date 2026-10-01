@@ -37,7 +37,11 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         """Enough of ThreadRunner for the HTTP layer."""
 
         def __init__(self, thread_id: str, event_log: Any) -> None:
-            self.state = type("S", (), {"session_id": "sess", "summary": "", "status": "idle"})()
+            self.state = type(
+                "S",
+                (),
+                {"session_id": "sess", "summary": "", "status": "idle", "permission_mode": "auto"},
+            )()
             self.log = event_log
             self.thread_id = thread_id
             self.manifest = type("M", (), {"scratch": ".agent"})()
@@ -45,9 +49,7 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
             self.busy = False
             self.mode: str | None = None
             self.interrupts = 0
-            self.resolved: list[tuple[str, bool]] = []
             self.translator = type("T", (), {"background_tasks": set()})()
-            self.approvals = type("A", (), {"pending": []})()
 
         async def send(self, text: str) -> int | None:
             self.sent.append(text)
@@ -58,9 +60,6 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
 
         async def set_permission_mode(self, mode: str) -> None:
             self.mode = mode
-
-        def resolve_approval(self, approval_id: str, allow: bool, message: str = "") -> None:
-            self.resolved.append((approval_id, allow))
 
         async def close(self) -> None: ...
 
@@ -109,10 +108,8 @@ def test_health_lists_profiles(client: TestClient) -> None:
 
 
 def test_builtin_profiles_are_written_to_disk(client: TestClient, settings: Settings) -> None:
-    # They exist as editable files, not string constants: the orchestration
-    # prompt is the asset that gets tuned most (and per provider, see F26).
     assert (settings.profiles_dir / "deep.toml").exists()
-    assert "编排者" in (settings.profiles_dir / "deep.md").read_text(encoding="utf-8")
+    assert 'permission_mode = "plan"' in (settings.profiles_dir / "deep.toml").read_text()
 
 
 def test_unknown_profile_is_rejected(client: TestClient) -> None:
@@ -196,6 +193,8 @@ def test_an_attachment_lands_in_the_workspace_and_is_named_in_the_prompt(
 
     prompt = client.started[-1].sent[0]  # type: ignore[attr-defined]
     # Caption first: it is what becomes the thread's summary.
+    assert prompt[1] == {"type": "localImage", "path": str(written[0])}
+    prompt = prompt[0]["text"]
     assert prompt.startswith("这张图哪里不对\n")
     assert str(written[0]) in prompt
     assert "screen.png" in prompt
@@ -208,7 +207,7 @@ def test_a_caption_is_optional(client: TestClient) -> None:
         json={"attachments": [{"name": "a.png", "mime": "image/png", "data_b64": PNG}]},
     )
     assert response.status_code == 202
-    assert client.started[-1].sent[0].startswith("[用户发来图片")  # type: ignore[attr-defined]
+    assert client.started[-1].sent[0][0]["text"].startswith("[用户发来图片")  # type: ignore[attr-defined]
 
 
 def test_the_senders_name_cannot_choose_the_path(client: TestClient, settings: Settings) -> None:
@@ -243,13 +242,13 @@ def test_mode_switch(client: TestClient) -> None:
     assert client.post(f"/v1/threads/{thread_id}/mode", json={"mode": "bogus"}).status_code == 422
 
 
-def test_approving_a_dead_thread_is_a_conflict_not_a_500(client: TestClient) -> None:
+def test_approval_endpoint_removed(client: TestClient) -> None:
     thread_id = new_thread(client)
     response = client.post(
         f"/v1/threads/{thread_id}/approve",
         json={"approval_id": "apr_x", "decision": "allow"},
     )
-    assert response.status_code == 409
+    assert response.status_code == 404
 
 
 # --- SSE -----------------------------------------------------------------
@@ -336,9 +335,7 @@ def test_replay_endpoint_does_not_wake_the_thread(client: TestClient) -> None:
     assert len(client.started) == before  # type: ignore[attr-defined]
 
 
-def test_startup_corrects_a_thread_a_crash_left_awaiting_approval(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_startup_recovers_busy(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     # End to end for the recovery pass: the correction has to be readable
     # through `/events/replay`, which is the only endpoint the bot uses after a
     # restart -- writing it anywhere the client does not look would be no fix.
@@ -346,8 +343,8 @@ def test_startup_corrects_a_thread_a_crash_left_awaiting_approval(
     store.create_thread("thr_x", "quick")
     for n, (type_, data) in enumerate(
         [
-            (EventType.APPROVAL_REQUIRED, {"approval_id": "apr_abc", "tool": "Bash"}),
-            (EventType.THREAD_STATUS, {"status": "awaiting_approval"}),
+            (EventType.TEXT, {"content": "处理中"}),
+            (EventType.THREAD_STATUS, {"status": "busy"}),
         ],
         start=1,
     ):
@@ -359,7 +356,7 @@ def test_startup_corrects_a_thread_a_crash_left_awaiting_approval(
         body = fresh.get("/v1/threads/thr_x/events/replay?after=2").json()
 
     assert [e["type"] for e in body["events"]] == ["error", "thread.status"]
-    assert body["events"][0]["payload"]["approval_ids"] == ["apr_abc"]
+    assert body["events"][0]["payload"]["code"] == "interrupted"
     assert body["events"][1]["payload"]["status"] == "idle"
 
 

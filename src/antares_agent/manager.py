@@ -1,13 +1,4 @@
-"""Owns the set of live threads.
-
-A `ClaudeSDKClient` is not free: V4 measured ~218MB PSS for the first one and
-~123MB for each additional, so they are pooled rather than kept one-per-thread
-forever. Evicting a thread does not lose it -- the CLI keeps its own session
-file, and the next message revives it through `resume`.
-
-Only idle threads are evicted. Tearing down a client mid-turn would abandon
-work and strand any approval waiting on it.
-"""
+"""Persistent threads with a shared Codex runtime."""
 
 from __future__ import annotations
 
@@ -33,6 +24,7 @@ from .eventlog import EventLog
 from .events import Event, EventType, ThreadStatus
 from .profiles import Profile
 from .runner import ThreadRunner
+from .runtime import Runtime
 from .store import Store, ThreadRow
 
 log = logging.getLogger(__name__)
@@ -63,6 +55,7 @@ class ThreadManager:
         self._live: OrderedDict[str, ThreadRunner] = OrderedDict()
         self._logs: dict[str, EventLog] = {}
         self._lock = asyncio.Lock()
+        self.runtime = Runtime(settings)
 
     def reload_manifest(self) -> manifest_mod.Manifest:
         """Re-read on every thread creation, so adding a repo needs no restart."""
@@ -80,17 +73,14 @@ class ThreadManager:
         if name not in self.profiles:
             raise UnknownProfile(name)
 
-        # Refreshed here rather than on first message, so the index the agent
-        # reads matches the workspace as it was when the thread began.
-        # Existing threads keep theirs (01-workspace-manifest.md).
-        #
-        # A duplicate skill name is raised, not logged: F2 showed the loser is
-        # shadowed silently with no syntax to disambiguate, so a warning would
-        # just mean the agent quietly runs the wrong skill.
         index.write(manifest)
 
         thread_id = "thr_" + secrets.token_hex(6)
-        return self.store.create_thread(thread_id, name)
+        self.store.create_thread(thread_id, name)
+        self.store.touch(thread_id, permission_mode=self.profiles[name].permission_mode)
+        row = self.store.get_thread(thread_id)
+        assert row is not None
+        return row
 
     async def runner(self, thread_id: str) -> ThreadRunner:
         """The live runner for a thread, starting or reviving it as needed."""
@@ -136,9 +126,17 @@ class ThreadManager:
                 profile=profile,
                 event_log=event_log,
                 artifacts=self.artifacts,
+                runtime=self.runtime,
+                persist=lambda state: self.store.touch(
+                    state.thread_id,
+                    session_id=state.session_id,
+                    summary=state.summary,
+                    permission_mode=state.permission_mode,
+                ),
             )
             runner.state.session_id = row.session_id
             runner.state.summary = row.summary
+            runner.state.permission_mode = row.permission_mode
             await runner.start(resume=row.session_id)
             self._live[thread_id] = runner
             return runner
@@ -167,15 +165,7 @@ class ThreadManager:
         await runner.close()
 
     async def reap_idle(self) -> list[str]:
-        """Close the CLI behind threads nobody has spoken to in a while.
-
-        A CPU measure, not a memory one. F31: once it has run a turn the CLI
-        keeps a ~60Hz loop going and costs a full core on the Pi for as long
-        as it lives, idle or not -- so a pool that only evicts under pressure
-        parks a spinning core per thread until something else needs the slot.
-        Eviction is lossless (the CLI keeps its session file), so the price of
-        being wrong here is one revive, paid by whoever speaks next.
-        """
+        """Evict idle runner caches."""
         ttl = self.settings.idle_ttl_s
         if ttl <= 0:
             return []
@@ -224,6 +214,7 @@ class ThreadManager:
         for thread_id in list(self._live):
             with contextlib.suppress(Exception):
                 await self.close_thread(thread_id)
+        await self.runtime.close()
         self.artifacts.close()
 
     # -- input -----------------------------------------------------------
@@ -241,27 +232,17 @@ class ThreadManager:
         )
         return position
 
-    def _stash(self, runner: ThreadRunner, text: str, attachments: Sequence[Attachment]) -> str:
-        """Put attachments on disk and name them in the prompt.
-
-        A path is the whole mechanism. `Read` renders images natively and is
-        already sandboxed, so an image only has to exist somewhere the model
-        may open -- there is no second content-block channel to build, and no
-        event type or SDK shape to keep in step with it. It also outlives the
-        turn: a blob inlined into a prompt is gone once the thread is evicted,
-        a file is still there when it resumes.
-
-        The sender's filename never becomes a path component. It comes from
-        Telegram, so a `../` in it would put the file wherever it liked. The
-        name on disk is ours; theirs is repeated as prose, where it can
-        mislead the model but not the filesystem.
-        """
+    def _stash(
+        self, runner: ThreadRunner, text: str, attachments: Sequence[Attachment]
+    ) -> str | list[dict]:
+        """Persist attachments and include native image inputs."""
         if not attachments:
             return text
 
         inbox = self.settings.workspace / runner.manifest.scratch / "inbox" / runner.thread_id
         inbox.mkdir(parents=True, exist_ok=True)
         lines: list[str] = []
+        images = []
         for item in attachments:
             path = inbox / (secrets.token_hex(4) + _suffix(item.mime))
             if item.path is None:
@@ -275,12 +256,14 @@ class ThreadManager:
                     temporary.replace(path)
                 finally:
                     temporary.unlink(missing_ok=True)
+            if item.mime.startswith("image/"):
+                images.append({"type": "localImage", "path": str(path)})
             kind = "图片" if item.mime.startswith("image/") else "文件"
             named = f" {item.name}" if item.name else ""
             lines.append(f"[用户发来{kind}{named}]：{path}")
         # Below the caption, not above it: the first line becomes the thread's
         # summary, and a file path is a poor name for a conversation.
-        return "\n".join([*([text] if text else []), *lines])
+        return [{"type": "text", "text": "\n".join([*([text] if text else []), *lines])}, *images]
 
     def event_log(self, thread_id: str) -> EventLog | None:
         return self._logs.get(thread_id)
@@ -295,22 +278,7 @@ class ThreadManager:
     # -- recovery --------------------------------------------------------
 
     def recover(self) -> list[str]:
-        """Write down what a crash left unfinished, before any client reads it.
-
-        A thread's status lives in its event stream, so a process that dies
-        mid-turn leaves every client holding a `busy` that is never followed by
-        an `idle`, and an `approval.required` that is never answered. Neither
-        corrects itself later: the CLI does fold the pending tool call into a
-        failure and keep the session consistent (V1), but it does not re-issue
-        the request on `resume`, and the thread stays cold until someone speaks
-        to it. So the correction is written here, at startup, while every
-        thread is still cold -- reviving one to tell it that it is idle would
-        cost a CLI process (~123MB, V4) for a thread nobody asked for.
-
-        A non-idle tail is the whole test. An unanswered approval always
-        leaves one behind, because the status only returns to `busy` once the
-        last pending approval resolves, so this never misses one.
-        """
+        """Persist interrupted work before serving clients."""
         for row in self.artifacts.list("outgoing"):
             if not row["published"] and self.store.get_thread(row["thread"]):
                 if not self.store.has_artifact(row["id"]):
@@ -333,28 +301,18 @@ class ThreadManager:
             if status is None or status == str(ThreadStatus.IDLE):
                 continue
 
-            lost = self.store.unanswered_approvals(row.thread_id)
-            if lost:
-                self._record(
-                    row.thread_id,
-                    EventType.ERROR,
-                    {
-                        "code": "approval_lost",
-                        # Named so the client can retire exactly the buttons
-                        # that died, instead of guessing or leaving them live.
-                        "approval_ids": lost,
-                        "message": "上次的审批请求因进程重启而失效，可以重发消息让它重试。",
-                    },
-                )
+            self._record(
+                row.thread_id,
+                EventType.ERROR,
+                {"code": "interrupted", "message": "服务重启中断了上次任务，未自动重试。"},
+            )
             self._record(
                 row.thread_id,
                 EventType.THREAD_STATUS,
                 {"status": str(ThreadStatus.IDLE), "background_agents": 0},
             )
             recovered.append(row.thread_id)
-            log.info(
-                "recovered thread %s from %s (%d lost approvals)", row.thread_id, status, len(lost)
-            )
+
         return recovered
 
     def _record(self, thread_id: str, type_: EventType, data: dict) -> None:

@@ -3,7 +3,7 @@ what repos exist before deciding which to touch.
 
 Not injected into the system prompt, on purpose: the system prompt sits in the
 cache prefix, the index grows with the workspace, and most tasks never need it.
-The root CLAUDE.md carries a one-line pointer instead and the agent pays a
+The root AGENTS.md carries a one-line pointer instead and the agent pays a
 single Read when it actually cares (see 01-workspace-manifest.md).
 """
 
@@ -28,11 +28,7 @@ _KIND_LABEL = {
 
 
 class DuplicateSkillError(Exception):
-    """Two repos ship a skill with the same name.
-
-    F2: the loser is shadowed silently and there is no working syntax to
-    disambiguate, so this has to be a hard error rather than a warning.
-    """
+    """Skill names must be unambiguous."""
 
 
 @dataclass(frozen=True)
@@ -44,12 +40,14 @@ class Skill:
 
 
 def scan_skills(repo: Repo, root: Path) -> list[Skill]:
-    """Read `<repo>/.claude/skills/*/SKILL.md` frontmatter."""
-    skills_dir = repo.abspath(root) / ".claude" / "skills"
+    """Read `<repo>/.agents/skills/*/SKILL.md` frontmatter."""
+    skills_dir = repo.abspath(root) / ".agents" / "skills"
     if not skills_dir.is_dir():
         return []
     found: list[Skill] = []
     for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        if not skill_md.resolve().is_relative_to(root.resolve()):
+            raise ValueError(f"技能路径超出工作区：{skill_md}")
         meta = _frontmatter(skill_md)
         found.append(
             Skill(
@@ -63,11 +61,11 @@ def scan_skills(repo: Repo, root: Path) -> list[Skill]:
 
 
 def scan_all_skills(manifest: Manifest) -> dict[str, list[Skill]]:
-    """Skills per repo, raising if any name is claimed twice (F2)."""
+    """Reject duplicate skill names across roots."""
     by_repo: dict[str, list[Skill]] = {}
     owners: dict[str, Skill] = {}
     clashes: list[str] = []
-    for repo in manifest.repos:
+    for repo in (Repo("@workspace", ".", "工作区技能"), *manifest.repos):
         skills = scan_skills(repo, manifest.root)
         by_repo[repo.name] = skills
         for skill in skills:
@@ -103,7 +101,7 @@ def render(manifest: Manifest, skills: dict[str, list[Skill]] | None = None) -> 
                 out += [repo.description.strip(), ""]
             repo_skills = skills.get(repo.name) or []
             if repo_skills:
-                out += ["可用 skill（进入该目录后自动可用）："]
+                out += ["可用 skill（每轮开始时刷新）："]
                 out += [
                     f"- `{s.name}`" + (f" — {_one_line(s.description)}" if s.description else "")
                     for s in repo_skills
@@ -126,12 +124,10 @@ def render(manifest: Manifest, skills: dict[str, list[Skill]] | None = None) -> 
 
 
 def write(manifest: Manifest, skills: dict[str, list[Skill]] | None = None) -> Path:
-    """Regenerate the index and make sure the root CLAUDE.md points at it.
-
-    Called when a thread is created; existing threads keep the index they
-    started with.
-    """
+    """Refresh workspace index and instruction pointer."""
     target = manifest.scratch_dir / "workspace-index.md"
+    if not target.resolve().is_relative_to(manifest.root.resolve()):
+        raise ValueError("索引路径超出工作区")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render(manifest, skills), encoding="utf-8")
     ensure_pointer(manifest.root)
@@ -139,14 +135,16 @@ def write(manifest: Manifest, skills: dict[str, list[Skill]] | None = None) -> P
 
 
 def ensure_pointer(root: Path) -> None:
-    """Idempotently keep the pointer line in the workspace CLAUDE.md.
+    """Idempotently keep the pointer line in the workspace AGENTS.md.
 
     Anything the user wrote by hand is preserved; only the marked block is
     ours to rewrite.
     """
-    claude_md = root / "CLAUDE.md"
+    agents_md = root / "AGENTS.md"
+    if not agents_md.resolve().is_relative_to(root.resolve()):
+        raise ValueError("指令路径超出工作区")
     block = f"{_POINTER_MARK}\n{POINTER}\n"
-    existing = claude_md.read_text(encoding="utf-8") if claude_md.exists() else ""
+    existing = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
     if _POINTER_MARK in existing:
         updated = re.sub(
             rf"{re.escape(_POINTER_MARK)}\n.*?(?=\n\n|\Z)", block.rstrip(), existing, flags=re.S
@@ -154,7 +152,7 @@ def ensure_pointer(root: Path) -> None:
     else:
         updated = block + ("\n" + existing.lstrip() if existing.strip() else "")
     if updated != existing:
-        claude_md.write_text(updated, encoding="utf-8")
+        agents_md.write_text(updated, encoding="utf-8")
 
 
 def _one_line(text: str) -> str:

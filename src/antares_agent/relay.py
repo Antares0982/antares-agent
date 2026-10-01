@@ -9,16 +9,6 @@ What it deliberately does *not* do is translate. The bus carries
 `02-sse-api.md`'s events verbatim (D11), so nothing here knows what a Telegram
 message is, and adding a new event type to the agent needs no change here.
 
-Two rules earn their keep and both are load-bearing:
-
-* **Follow only while a thread is busy** (D13). `GET /events` revives the
-  thread as a side effect of subscribing, and a live thread is ~123MB (V4).
-  Holding a stream per chat would pin every chat's runner and defeat the LRU.
-  Idle threads emit nothing by definition, so nothing is missed.
-* **Never lose an approval.** A dropped `approval.required` strands the thread
-  in `awaiting_approval` with nobody able to answer, so the queue is durable
-  and the cursor is the client's, not ours.
-
 Standalone: depends only on `httpx` and `aio_pika`. Configure by environment.
 
 Env:
@@ -235,15 +225,6 @@ class Relay:
                     },
                 )
                 self._follow(thread_id, cmd.get("after"))
-            case "approve":
-                await self._post(
-                    f"/v1/threads/{thread_id}/approve",
-                    {
-                        "approval_id": cmd["approval_id"],
-                        "decision": cmd["decision"],
-                        "message": cmd.get("message", ""),
-                    },
-                )
             case "interrupt":
                 await self._post(f"/v1/threads/{thread_id}/interrupt", {})
             case "mode":
@@ -282,8 +263,6 @@ class Relay:
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         response = await self._http.post(path, json=body)
         if response.status_code >= 400:
-            # 409 in particular is not a bug: the thread was evicted and the
-            # approval went with it. The bot needs the code to say so.
             raise RelayError(response.status_code, _detail(response))
         return response.json() if response.content else {}
 
