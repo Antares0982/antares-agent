@@ -83,6 +83,28 @@ async def _no_wait(_seconds: float) -> None:
 # --- following -----------------------------------------------------------
 
 
+@pytest.mark.parametrize("after", [None, 0])
+async def test_first_turn_replay(after) -> None:
+    frames = [
+        event(1, "thread.status", status="busy"),
+        event(2, "text", content="hi"),
+        event(3, "thread.status", status="idle"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json={"status": "accepted"})
+        if request.url.path.endswith("/events"):
+            replay = request.url.params.get("after") == "0"
+            return httpx.Response(200, content=sse(frames if replay else frames[-1:]))
+        return httpx.Response(200, json={"status": "busy"})
+
+    relay = relay_over(handler)
+    await relay._dispatch({"op": "message", "thread_id": "thr_x", "text": "hi", "after": after})
+    await relay._followers["thr_x"]
+    assert relay.published == frames
+
+
 async def test_follow_stops_at_idle_and_forwards_everything() -> None:
     frames = [
         event(2, "thread.status", status="busy"),

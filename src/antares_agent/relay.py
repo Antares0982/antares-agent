@@ -356,7 +356,7 @@ class Relay:
         return response.status_code < 400 and response.json().get("status") != "idle"
 
     async def _stream(self, thread_id: str, after: int | None):
-        params = {"after": after} if after else {}
+        params = {"after": after or 0}
         async with self._http.stream(
             "GET", f"/v1/threads/{thread_id}/events", params=params, timeout=_TIMEOUT
         ) as response:
