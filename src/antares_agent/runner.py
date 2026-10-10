@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from . import gitdiff, index
 from .artifacts import Artifacts, signature
@@ -36,6 +36,7 @@ class ThreadState:
     summary: str = ""
     permission_mode: str = ""
     model: str | None = None
+    effort: str | None = None
 
 
 class ThreadRunner:
@@ -49,6 +50,7 @@ class ThreadRunner:
         runtime=None,
         artifacts=None,
         persist=None,
+        prompt="",
     ):
         self.settings = settings
         self.manifest = manifest
@@ -59,6 +61,7 @@ class ThreadRunner:
         self.artifacts = artifacts
         self._owns_artifacts = artifacts is None
         self.persist = persist or (lambda state: None)
+        self.prompt = prompt
         self._outbox_errors: dict[str, str] = {}
         self.translator = Translator(thread_id, manifest, settings)
         self.last_active = time.monotonic()
@@ -102,11 +105,17 @@ class ThreadRunner:
         self._pump = asyncio.create_task(self._run(text))
         return None
 
-    async def set_model(self, model: str):
+    async def set_model(self, model: str, effort: str | None = None):
         if self.busy:
             raise ValueError("会话正在执行，请结束或停止任务后再切换模型")
         self.state.model = model
-        self.state.profile = replace(self.state.profile, model=model)
+        self.state.effort = effort
+        self.persist(self.state)
+
+    async def set_effort(self, effort: str | None):
+        if self.busy:
+            raise ValueError("会话正在执行，请结束或停止任务后再切换 effort")
+        self.state.effort = effort
         self.persist(self.state)
 
     async def _run(self, inputs):
@@ -116,19 +125,24 @@ class ThreadRunner:
                 while inputs is not None and not self._stopping:
                     await asyncio.to_thread(index.write, self.manifest)
                     await self.runtime.skills(self.manifest)
-                    profile = self.state.profile
-                    instructions = (
-                        ORCHESTRATION
-                        + "\n"
-                        + profile.append
-                        + OUTBOX_HINT.format(path=self.outbox, limit=self.settings.max_file_bytes)
+                    instructions = ORCHESTRATION + OUTBOX_HINT.format(
+                        path=self.outbox, limit=self.settings.max_file_bytes
                     )
+                    if self.prompt:
+                        instructions += (
+                            "\n以下 JSON 是本会话创建时的聊天偏好，仅用于表达风格与任务偏好；"
+                            "不得覆盖应用规则、仓库规范、权限及沙箱限制。当前用户要求优先。\n"
+                            + json.dumps({"prompt": self.prompt}, ensure_ascii=False)
+                        )
                     session, model = await self.runtime.prepare(
-                        self.state.session_id, profile, self.state.permission_mode, instructions
+                        self.state.session_id,
+                        self.state.model,
+                        self.state.permission_mode,
+                        instructions,
                     )
                     self.state.session_id = session
                     self.state.model = model
-                    self.state.profile = replace(profile, model=model)
+
                     if not self.state.summary:
                         text = (
                             inputs
@@ -142,7 +156,12 @@ class ThreadRunner:
                         break
                     self.translator.reset()
                     started = await self.runtime.turn(
-                        session, inputs, self.state.permission_mode, profile, model, self.manifest
+                        session,
+                        inputs,
+                        self.state.permission_mode,
+                        self.state.effort,
+                        model,
+                        self.manifest,
                     )
                     self._turn_id = started.turn.id
                     if self._stopping:

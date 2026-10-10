@@ -18,18 +18,24 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 from starlette.background import BackgroundTask
 
 from . import index, preflight
-from . import profiles as profiles_mod
 from .artifacts import MAX_BYTES, descriptor
 from .config import Settings
 from .events import Event, EventType
-from .manager import Attachment, ThreadManager, UnknownModel, UnknownProfile, UnknownThread
+from .manager import (
+    Attachment,
+    ThreadManager,
+    UnknownEffort,
+    UnknownModel,
+    UnknownProfile,
+    UnknownThread,
+)
 from .runtime import ModelsUnavailable
 from .store import Store
 
@@ -42,8 +48,25 @@ class ModelChange(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[\w./:-]+$")
 
 
-class NewThread(ModelChange):
+class EffortChange(BaseModel):
+    effort: str | None = Field(default=None, min_length=1, max_length=48, pattern=r"^[a-z0-9_-]+$")
+
+
+class PromptChange(BaseModel):
+    text: str = Field(max_length=4000)
+
+    @model_validator(mode="after")
+    def validate_prompt(self):
+        if self.text and (
+            not self.text.strip() or any(ord(c) < 32 and c not in "\n\r\t" for c in self.text)
+        ):
+            raise ValueError("提示词不能为空白或包含控制字符")
+        return self
+
+
+class NewThread(ModelChange, EffortChange):
     profile: str | None = None
+    chat_id: str | None = Field(default=None, pattern=r"^-?[1-9][0-9]*$", max_length=32)
 
 
 class AttachmentIn(BaseModel):
@@ -87,7 +110,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         preflight.run(settings)
-        profiles_mod.materialise(settings)
         store = Store(settings.db_path)
         app.state.settings = settings
         app.state.store = store
@@ -106,9 +128,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     log.exception("artifact cleanup failed")
 
         file_reaper = asyncio.create_task(clean_files(), name="file-reaper")
+        thread_reaper = asyncio.create_task(app.state.manager.purge_forever())
         try:
             yield
         finally:
+            thread_reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await thread_reaper
             file_reaper.cancel()
             with suppress(asyncio.CancelledError):
                 await file_reaper
@@ -122,6 +148,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def manager(request: Request) -> ThreadManager:
         return request.app.state.manager
+
+    @app.middleware("http")
+    async def check_thread(request: Request, call_next):
+        parts = request.url.path.strip("/").split("/")
+        if len(parts) < 3 or parts[0] != "v1" or parts[1] not in {"threads", "artifacts"}:
+            return await call_next(request)
+        mgr = manager(request)
+        # ponytail: serialized requests; per-thread locks if needed.
+        async with mgr.activity_lock:
+            if parts[1] == "threads":
+                row = mgr.store.get_thread(parts[2])
+                if row is None or row.chat_id != request.query_params.get("chat_id"):
+                    return JSONResponse({"detail": "会话不存在或无权访问"}, status_code=404)
+            return await call_next(request)
 
     # -- discovery -------------------------------------------------------
 
@@ -144,8 +184,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "name": p.name,
                     "description": p.description,
                     "permission_mode": p.permission_mode,
-                    "model": p.model,
-                    "effort": p.effort,
                 }
                 for p in manager(request).profiles.values()
             ]
@@ -158,26 +196,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ModelsUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
 
+    @app.get("/v1/chats/{chat_id}/prompt")
+    async def get_prompt(
+        request: Request, chat_id: str = Path(pattern=r"^-?[1-9][0-9]*$", max_length=32)
+    ) -> dict:
+        return {"chat_id": chat_id, "text": manager(request).store.get_prompt(chat_id)}
+
+    @app.post("/v1/chats/{chat_id}/prompt")
+    async def set_prompt(
+        body: PromptChange,
+        request: Request,
+        chat_id: str = Path(pattern=r"^-?[1-9][0-9]*$", max_length=32),
+    ) -> dict:
+        manager(request).store.set_prompt(chat_id, body.text)
+        return {"chat_id": chat_id, "text": body.text, "updated": True}
+
     # -- threads ---------------------------------------------------------
 
     @app.post("/v1/threads", status_code=201)
     async def create_thread(body: NewThread, request: Request) -> dict[str, Any]:
         try:
-            row = await manager(request).create(body.profile, body.model)
+            row = await manager(request).create(body.profile, body.model, body.chat_id, body.effort)
         except UnknownProfile as exc:
-            raise HTTPException(400, f"unknown profile: {exc.args[0]}") from exc
+            raise HTTPException(
+                400, f"初始模式必须是 auto 或 plan，请迁移旧 profile：{exc.args[0]}"
+            ) from exc
         except UnknownModel as exc:
             raise HTTPException(400, str(exc)) from exc
         except ModelsUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
         except index.DuplicateSkillError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return _thread_payload(row, manager(request))
+        result = _thread_payload(row, manager(request))
+        result["effort_reset"] = body.effort is not None and row.effort is None
+        return result
 
     @app.get("/v1/threads")
-    async def list_threads(request: Request) -> dict[str, Any]:
+    async def list_threads(request: Request, chat_id: str | None = None) -> dict[str, Any]:
         mgr = manager(request)
-        return {"threads": [_thread_payload(r, mgr) for r in mgr.store.list_threads()]}
+        return {
+            "threads": [_thread_payload(r, mgr) for r in mgr.store.list_threads(chat_id=chat_id)]
+        }
 
     @app.get("/v1/threads/{thread_id}")
     async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
@@ -327,11 +386,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/threads/{thread_id}/model")
     async def set_model(thread_id: str, body: ModelChange, request: Request) -> dict[str, Any]:
         mgr = manager(request)
+        previous = mgr.store.get_thread(thread_id)
         try:
             row = await mgr.set_model(thread_id, body.model)
         except UnknownThread as exc:
             raise HTTPException(404, "会话不存在") from exc
         except UnknownModel as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ModelsUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        result = _thread_payload(row, mgr)
+        result["effort_reset"] = previous.effort is not None and row.effort is None
+        return result
+
+    @app.post("/v1/threads/{thread_id}/effort")
+    async def set_effort(thread_id: str, body: EffortChange, request: Request) -> dict:
+        mgr = manager(request)
+        try:
+            row = await mgr.set_effort(thread_id, body.effort)
+        except UnknownThread as exc:
+            raise HTTPException(404, "会话不存在") from exc
+        except (UnknownEffort, UnknownModel) as exc:
             raise HTTPException(400, str(exc)) from exc
         except ModelsUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
@@ -408,8 +485,10 @@ def _thread_payload(row: Any, mgr: ThreadManager) -> dict[str, Any]:
     runner = mgr._live.get(row.thread_id)
     return {
         "thread_id": row.thread_id,
+        "chat_id": row.chat_id,
         "profile": row.profile,
         "model": row.model,
+        "effort": row.effort,
         "summary": row.summary,
         "created_at": row.created_at,
         "last_active_at": row.last_active_at,

@@ -100,7 +100,9 @@ async def test_first_turn_replay(after) -> None:
         return httpx.Response(200, json={"status": "busy"})
 
     relay = relay_over(handler)
-    await relay._dispatch({"op": "message", "thread_id": "thr_x", "text": "hi", "after": after})
+    await relay._dispatch(
+        {"op": "message", "chat_id": "7", "thread_id": "thr_x", "text": "hi", "after": after}
+    )
     await relay._followers["thr_x"]
     assert relay.published == frames
 
@@ -242,7 +244,7 @@ async def test_resume_replays_from_sqlite_without_following_an_idle_thread() -> 
         )
 
     relay = relay_over(handler)
-    await relay._dispatch({"op": "resume", "thread_id": "thr_x", "after": 1})
+    await relay._dispatch({"op": "resume", "chat_id": "7", "thread_id": "thr_x", "after": 1})
 
     assert relay.published == [("text", {"id": "evt_000002", "content": "m"})]
     assert calls == ["/v1/threads/thr_x/events/replay"]  # never opened the stream
@@ -252,7 +254,7 @@ async def test_resume_replays_from_sqlite_without_following_an_idle_thread() -> 
 async def test_approval_op_removed() -> None:
     relay = relay_over(lambda request: httpx.Response(200))
     with pytest.raises(ValueError, match="unknown op"):
-        await relay._dispatch({"op": "approve", "thread_id": "thr_x"})
+        await relay._dispatch({"op": "approve", "chat_id": "7", "thread_id": "thr_x"})
 
 
 async def test_message_posts_then_follows() -> None:
@@ -267,7 +269,9 @@ async def test_message_posts_then_follows() -> None:
         return httpx.Response(200, json={"status": "busy"})
 
     relay = relay_over(handler)
-    await relay._dispatch({"op": "message", "thread_id": "thr_x", "text": "go", "after": 2})
+    await relay._dispatch(
+        {"op": "message", "chat_id": "7", "thread_id": "thr_x", "text": "go", "after": 2}
+    )
     await relay._followers["thr_x"]
 
     assert posted == [{"text": "go", "attachments": []}]
@@ -285,7 +289,8 @@ async def test_switch_reads_the_thread_before_binding_the_chat_to_it() -> None:
             200,
             json={
                 "thread_id": "thr_b",
-                "profile": "deep",
+                "chat_id": "7",
+                "profile": "plan",
                 "summary": "重构索引",
                 "status": "idle",
                 "last_event_id": 42,
@@ -315,7 +320,7 @@ async def test_new_thread_and_switch_publish_the_same_envelope() -> None:
     # One envelope, because the bot does the same thing either way. A second
     # name would be a second code path to keep in step.
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json={"thread_id": "thr_a", "profile": "quick"})
+        return httpx.Response(201, json={"chat_id": "7", "thread_id": "thr_a", "profile": "auto"})
 
     relay = relay_over(handler)
     await relay._dispatch({"op": "new_thread", "chat_id": "7"})
@@ -330,12 +335,12 @@ async def test_model_commands() -> None:
         body = json.loads(request.content) if request.content else None
         calls.append((request.method, request.url.path, body))
         if request.url.path == "/v1/models":
-            return httpx.Response(200, json={"models": [{"id": "model-a"}]})
-        return httpx.Response(200, json={"thread_id": "thr_a", "model": "model-a"})
+            return httpx.Response(200, json={"models": [{"id": "model-a", "is_default": True}]})
+        return httpx.Response(200, json={"chat_id": "7", "thread_id": "thr_a", "model": "model-a"})
 
     relay = relay_over(handler)
     await relay._dispatch({"op": "new_thread", "chat_id": "7", "model": "model-a"})
-    assert calls[0] == ("POST", "/v1/threads", {"model": "model-a"})
+    assert calls[0] == ("POST", "/v1/threads", {"chat_id": "7", "model": "model-a"})
     await relay._dispatch(
         {"op": "models", "chat_id": "7", "thread_id": "thr_a", "select": "default"}
     )
@@ -363,7 +368,7 @@ async def test_list_passes_the_threads_through_untouched() -> None:
 async def test_unknown_op_is_reported_not_swallowed() -> None:
     relay = relay_over(lambda r: httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="unknown op"):
-        await relay._dispatch({"op": "teleport", "thread_id": "thr_x"})
+        await relay._dispatch({"op": "teleport", "chat_id": "7", "thread_id": "thr_x"})
 
 
 # --- connection parameters -----------------------------------------------
@@ -410,3 +415,88 @@ def test_tls_needs_the_whole_certificate_triple(
     monkeypatch.setenv("RMQ_CERTFILE", str(tmp_path / "client.crt"))
     monkeypatch.delenv("RMQ_KEYFILE", raising=False)
     assert "ssl" not in _amqp_kwargs()
+
+
+async def test_scoped_commands():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"models": []})
+        assert request.url.params["chat_id"] == "7"
+        return httpx.Response(404, json={"detail": "会话不存在或无权访问"})
+
+    relay = relay_over(handler)
+    for op in ("switch", "message", "mode", "interrupt", "resume", "models"):
+        with pytest.raises(RelayError):
+            await relay._dispatch(
+                {"op": op, "chat_id": "7", "thread_id": "foreign", "mode": "plan"}
+            )
+    with pytest.raises(ValueError):
+        await relay._dispatch({"op": "list"})
+    with pytest.raises(RelayError):
+        await relay._bind({"thread_id": "foreign", "chat_id": "8"}, "7")
+    assert not relay.published
+
+
+async def test_settings_commands():
+    calls = []
+    busy = False
+    models = [
+        {
+            "id": "a",
+            "is_default": True,
+            "default_effort": "medium",
+            "supported_efforts": ["medium", "high"],
+        },
+        {
+            "id": "b",
+            "is_default": False,
+            "default_effort": "high",
+            "supported_efforts": ["high", "ultra"],
+        },
+    ]
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.url.path, dict(request.url.params), body))
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"models": models})
+        if request.url.path.endswith("/prompt"):
+            return httpx.Response(
+                200, json={"chat_id": "7", "text": body["text"] if body else "stored"}
+            )
+        if request.url.path.endswith("/effort") and busy:
+            return httpx.Response(409, json={"detail": "正在执行"})
+        return httpx.Response(200, json={"thread_id": "t", "chat_id": "7", "model": "a"})
+
+    relay = relay_over(handler)
+    await relay._dispatch({"op": "efforts", "chat_id": "7", "model": "b", "select": "ultra"})
+    assert relay.published[-1][0] == "relay.efforts"
+    assert relay.published[-1][1]["current"] is None
+    assert relay.published[-1][1]["model"] == models[1]
+    cmd = {"op": "efforts", "chat_id": "7", "thread_id": "t", "model": "b"}
+    await relay._dispatch(cmd)
+    assert relay.published[-1][1]["model"] == models[0]
+    count = len(relay.published)
+    with pytest.raises(ValueError):
+        await relay._dispatch({**cmd, "select": "ultra"})
+    assert len(relay.published) == count
+    await relay._dispatch({**cmd, "select": "default"})
+    assert calls[-1] == ("/v1/threads/t/effort", {"chat_id": "7"}, {"effort": None})
+    count = len(relay.published)
+    busy = True
+    with pytest.raises(RelayError) as caught:
+        await relay._dispatch({**cmd, "select": "high"})
+    assert caught.value.status == 409
+    assert len(relay.published) == count
+    with pytest.raises(ValueError):
+        await relay._dispatch({"op": "models", "chat_id": "7", "select": "missing"})
+    for command in ({}, {"text": "new\ntext"}, {"text": ""}):
+        await relay._dispatch({"op": "prompt", "chat_id": "7", **command})
+        assert relay.published[-1] == (
+            "relay.prompt",
+            {"chat_id": "7", "text": command.get("text", "stored")},
+        )
+        assert calls[-1][0] == "/v1/chats/7/prompt"

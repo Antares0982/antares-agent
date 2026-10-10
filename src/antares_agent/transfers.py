@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from .artifacts import CHUNK, RETRY_WINDOW, descriptor, valid_id
+from .relay import RelayError, chat_id
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class Transfers:
         self.jobs = Jobs(state)
 
     def enqueue(self, command: dict) -> None:
+        chat_id(command)
         command.setdefault("request_id", secrets.token_hex(16))
         valid_id(command["request_id"])
         if not isinstance(command.get("thread_id"), str):
@@ -105,6 +107,8 @@ class Transfers:
         await self.relay._post(f"/v1/artifacts/{item['artifact_id']}/complete", {})
 
     async def deliver(self, command: dict) -> None:
+        chat = chat_id(command)
+        await self.relay._get(f"/v1/threads/{command['thread_id']}", chat_id=chat)
         for raw in command.get("attachments", []):
             if "artifact_id" not in raw:
                 continue
@@ -113,7 +117,10 @@ class Transfers:
                 src.raise_for_status()
                 reply = await self.relay._http.put(
                     f"/v1/threads/{command['thread_id']}/attachments/{item['artifact_id']}",
-                    params={k: v for k, v in item.items() if k != "artifact_id"},
+                    params={
+                        **{k: v for k, v in item.items() if k != "artifact_id"},
+                        "chat_id": chat,
+                    },
                     headers={"Content-Length": str(item["size"])},
                     content=checked_stream(src, item),
                     timeout=httpx.Timeout(120),
@@ -143,9 +150,16 @@ class Transfers:
             status = getattr(exc, "status", None)
             if isinstance(exc, httpx.HTTPStatusError):
                 status = exc.response.status_code
-            terminal = isinstance(exc, ValueError) or status in (400, 401, 403, 409, 413, 422)
+            missing_thread = status == 404 and (
+                isinstance(exc, RelayError)
+                or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.request.url.path.startswith("/v1/threads/")
+                )
+            )
+            terminal = isinstance(exc, ValueError) or status in (400, 401, 403, 404, 409, 413, 422)
             if terminal:
-                if lane == "outgoing":
+                if lane == "outgoing" and status != 404:
                     await self.relay._post(
                         f"/v1/artifacts/{row['id']}/complete",
                         {
@@ -153,12 +167,14 @@ class Transfers:
                             "error": str(exc)[:512],
                         },
                     )
-                else:
+                elif lane == "incoming":
                     await self.relay._publish(
                         "relay.cmd_failed",
                         {
                             "op": "message",
                             "thread_id": data["thread_id"],
+                            "chat_id": data.get("chat_id"),
+                            "status": 404 if missing_thread else None,
                             "detail": f"消息未完成交接：{exc}",
                         },
                     )

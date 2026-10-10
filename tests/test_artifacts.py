@@ -128,10 +128,12 @@ async def test_export_import(tmp_path: Path) -> None:
         httpx.AsyncClient(transport=httpx.MockTransport(local), base_url="http://agent") as api,
         httpx.AsyncClient(transport=httpx.MockTransport(remote), base_url="https://files") as files,
     ):
-        relay = SimpleNamespace(_http=api, _post=post, _dispatch=dispatch)
+        from unittest.mock import AsyncMock
+
+        relay = SimpleNamespace(_http=api, _post=post, _dispatch=dispatch, _get=AsyncMock())
         transfers = Transfers(relay, files, tmp_path / "jobs.sqlite")
         await transfers.export(item)
-        await transfers.deliver({"thread_id": "thread", "attachments": [item]})
+        await transfers.deliver({"chat_id": "7", "thread_id": "thread", "attachments": [item]})
         assert calls[-1] == ("message", "thread")
         assert any(c[0] == "complete" for c in calls)
         transfers.jobs.close()
@@ -146,7 +148,7 @@ async def test_event_recovery(tmp_path: Path) -> None:
         workspace=tmp_path, db_path=tmp_path / "db.sqlite", profiles_dir=tmp_path / "profiles"
     )
     store = Store(settings.db_path)
-    store.create_thread("thread", "quick")
+    store.create_thread("thread", "auto")
     manager = ThreadManager(settings, store)
     source = tmp_path / "file"
     source.write_bytes(b"hello")
@@ -175,7 +177,9 @@ async def test_failed_queue_requeues() -> None:
     from antares_agent.relay import Relay
 
     class Incoming:
-        body = json.dumps({"op": "message", "request_id": "a" * 32, "thread_id": "t"}).encode()
+        body = json.dumps(
+            {"op": "message", "chat_id": "7", "request_id": "a" * 32, "thread_id": "t"}
+        ).encode()
 
         @asynccontextmanager
         async def process(self, requeue):
@@ -205,3 +209,32 @@ async def test_invalid_command() -> None:
 
     async with httpx.AsyncClient() as http:
         await Relay(http)._on_command(Incoming())
+
+
+async def test_transfer_scope(tmp_path):
+    from unittest.mock import AsyncMock
+
+    from antares_agent.relay import RelayError
+
+    relay = SimpleNamespace(
+        _get=AsyncMock(side_effect=RelayError(404, "unknown")),
+        _dispatch=AsyncMock(),
+        _publish=AsyncMock(),
+    )
+    remote = SimpleNamespace(stream=AsyncMock())
+    transfers = Transfers(relay, remote, tmp_path / "jobs.sqlite")
+    command = {
+        "op": "message",
+        "chat_id": "7",
+        "thread_id": "foreign",
+        "request_id": "a" * 32,
+        "attachments": [],
+    }
+    transfers.enqueue(command)
+    await transfers.tick("incoming")
+    relay._get.assert_awaited_once_with("/v1/threads/foreign", chat_id="7")
+    relay._dispatch.assert_not_awaited()
+    remote.stream.assert_not_called()
+    assert relay._publish.await_args.args[1]["status"] == 404
+    assert transfers.jobs.due("incoming") is None
+    transfers.jobs.close()

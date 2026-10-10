@@ -12,7 +12,8 @@ import shutil
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import index
@@ -38,6 +39,10 @@ class UnknownProfile(KeyError):
     pass
 
 
+class UnknownEffort(ValueError):
+    pass
+
+
 class UnknownModel(ValueError):
     pass
 
@@ -55,10 +60,11 @@ class ThreadManager:
         self.settings = settings
         self.store = store
         self.artifacts = Artifacts(settings.artifact_path)
-        self.profiles: dict[str, Profile] = profiles_mod.load(settings)
+        self.profiles: dict[str, Profile] = profiles_mod.PROFILES
         self._live: OrderedDict[str, ThreadRunner] = OrderedDict()
         self._logs: dict[str, EventLog] = {}
         self._lock = asyncio.Lock()
+        self.activity_lock = asyncio.Lock()
         self.runtime = Runtime(settings)
 
     def reload_manifest(self) -> manifest_mod.Manifest:
@@ -71,46 +77,66 @@ class ThreadManager:
 
     # -- lifecycle -------------------------------------------------------
 
-    async def create(self, profile_name: str | None = None, model: str | None = None) -> ThreadRow:
+    async def create(
+        self,
+        profile_name: str | None = None,
+        model: str | None = None,
+        chat_id: str | None = None,
+        effort: str | None = None,
+    ) -> ThreadRow:
         manifest = self.reload_manifest()
         name = profile_name or manifest.default_profile
         if name not in self.profiles:
             raise UnknownProfile(name)
-        if model is not None:
-            model = await self.select_model(model, name)
+        if model is not None or effort is not None:
+            info = await self.model_info(model)
+            model = info["id"]
+            if effort not in info["supported_efforts"]:
+                effort = None
 
         index.write(manifest)
 
         thread_id = "thr_" + secrets.token_hex(6)
-        self.store.create_thread(thread_id, name)
+        self.store.create_thread(thread_id, name, chat_id, self.store.get_prompt(chat_id))
         self.store.touch(
             thread_id,
             permission_mode=self.profiles[name].permission_mode,
-            model=model or self.profiles[name].model,
+            model=model,
+            effort=effort,
         )
         row = self.store.get_thread(thread_id)
         assert row is not None
         return row
 
-    async def select_model(self, model: str | None, profile_name: str) -> str:
+    async def model_info(self, model: str | None) -> dict:
         models = await self.runtime.models()
-        profile = self.profiles.get(profile_name) or Profile(profile_name)
-        selected = (
-            model
-            or profile.model
-            or next((item["id"] for item in models if item["is_default"]), None)
+        info = next(
+            (m for m in models if m["id"] == model or (model is None and m["is_default"])), None
         )
-        if selected not in {item["id"] for item in models}:
+        if info is None:
             raise UnknownModel("模型不可用，请使用 /model 重新选择")
-        return selected
+        return info
 
     async def set_model(self, thread_id: str, model: str | None) -> ThreadRow:
+        info = await self.model_info(model)
+        runner = await self.runner(thread_id)
+        effort = runner.state.effort
+        if effort not in info["supported_efforts"]:
+            effort = None
+        await runner.set_model(info["id"], effort)
+        row = self.store.get_thread(thread_id)
+        assert row is not None
+        return row
+
+    async def set_effort(self, thread_id: str, effort: str | None) -> ThreadRow:
         row = self.store.get_thread(thread_id)
         if row is None:
             raise UnknownThread(thread_id)
-        selected = await self.select_model(model, row.profile)
+        info = await self.model_info(row.model)
+        if effort is not None and effort not in info["supported_efforts"]:
+            raise UnknownEffort("当前模型不支持该 effort，请使用 /effort 重新选择")
         runner = await self.runner(thread_id)
-        await runner.set_model(selected)
+        await runner.set_effort(effort)
         row = self.store.get_thread(thread_id)
         assert row is not None
         return row
@@ -134,8 +160,6 @@ class ThreadManager:
             await self._evict_if_needed()
 
             profile = self.profiles.get(row.profile) or Profile(name=row.profile)
-            if row.model is not None:
-                profile = replace(profile, model=row.model)
             event_log = self._logs.get(thread_id)
             if event_log is None:
                 event_log = EventLog(
@@ -162,18 +186,21 @@ class ThreadManager:
                 event_log=event_log,
                 artifacts=self.artifacts,
                 runtime=self.runtime,
+                prompt=row.prompt,
                 persist=lambda state: self.store.touch(
                     state.thread_id,
                     session_id=state.session_id,
                     summary=state.summary,
                     permission_mode=state.permission_mode,
                     model=state.model,
+                    effort=state.effort,
                 ),
             )
             runner.state.session_id = row.session_id
             runner.state.summary = row.summary
             runner.state.permission_mode = row.permission_mode
             runner.state.model = row.model
+            runner.state.effort = row.effort
             await runner.start(resume=row.session_id)
             self._live[thread_id] = runner
             return runner
@@ -198,7 +225,7 @@ class ThreadManager:
         nothing instead of resuming this one.
         """
         runner = self._live.pop(thread_id)
-        self.store.touch(thread_id, session_id=runner.state.session_id)
+        self.store.touch(thread_id, session_id=runner.state.session_id, activity=False)
         await runner.close()
 
     async def reap_idle(self) -> list[str]:
@@ -237,7 +264,7 @@ class ThreadManager:
     async def close_thread(self, thread_id: str) -> None:
         runner = self._live.pop(thread_id, None)
         if runner is not None:
-            self.store.touch(thread_id, session_id=runner.state.session_id)
+            self.store.touch(thread_id, session_id=runner.state.session_id, activity=False)
             await runner.close()
         self._logs.pop(thread_id, None)
 
@@ -246,6 +273,43 @@ class ThreadManager:
             raise UnknownThread(thread_id)
         await self.close_thread(thread_id)
         self.store.delete_thread(thread_id)
+
+    async def purge_expired(self) -> list[str]:
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="milliseconds")
+        purged = []
+        async with self.activity_lock, self._lock:
+            for row in self.store.expired_threads(cutoff):
+                current = self.store.get_thread(row.thread_id)
+                if current is not None and current.last_active_at > cutoff:
+                    continue
+                row = current or row
+                runner = self._live.get(row.thread_id)
+                if runner and runner.busy:
+                    continue
+                if self.artifacts.upload_lock.locked() or self.artifacts.thread_active(
+                    row.thread_id
+                ):
+                    continue
+                try:
+                    self.store.mark_deleting(row.thread_id)
+                    await self.close_thread(row.thread_id)
+                    if row.session_id:
+                        await self.runtime.delete_thread(row.session_id)
+                    self.artifacts.purge_thread(row.thread_id)
+                    self.store.purge_thread(row.thread_id)
+                    purged.append(row.thread_id)
+                    log.info("deleted expired thread %s", row.thread_id)
+                except Exception:
+                    log.exception("expired thread deletion failed: %s", row.thread_id)
+        return purged
+
+    async def purge_forever(self) -> None:
+        while True:
+            try:
+                await self.purge_expired()
+            except Exception:
+                log.exception("thread cleanup failed")
+            await asyncio.sleep(3600)
 
     async def shutdown(self) -> None:
         for thread_id in list(self._live):
@@ -333,7 +397,7 @@ class ThreadManager:
             )
         self.artifacts.cleanup()
         recovered: list[str] = []
-        for row in self.store.list_threads(limit=10_000):
+        for row in self.store.active_threads():
             status = self.store.last_status(row.thread_id)
             if status is None or status == str(ThreadStatus.IDLE):
                 continue

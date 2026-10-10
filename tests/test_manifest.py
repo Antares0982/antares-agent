@@ -18,7 +18,7 @@ def _workspace(tmp_path: Path, toml: str, repos: tuple[str, ...] = ("api", "web"
 GOOD = """
     [workspace]
     scratch = ".agent"
-    default_profile = "deep"
+    default_profile = "plan"
 
     [[repo]]
     name = "api"
@@ -42,7 +42,7 @@ GOOD = """
 def test_load_valid(tmp_path: Path) -> None:
     m = manifest.load(_workspace(tmp_path, GOOD))
     assert [r.name for r in m.repos] == ["api", "web"]
-    assert m.default_profile == "deep"
+    assert m.default_profile == "plan"
     assert m.relations[0].src == "web" and m.relations[0].dst == "api"
     assert m.repo("api") is not None and m.repo("nope") is None
 

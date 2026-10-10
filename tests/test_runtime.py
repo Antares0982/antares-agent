@@ -1,10 +1,10 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from antares_agent.config import Settings
 from antares_agent.manifest import empty
-from antares_agent.profiles import Profile
 from antares_agent.runtime import Runtime, prepare_home
 
 
@@ -30,14 +30,19 @@ async def test_forced_policy(tmp_path):
             return SimpleNamespace(turn=SimpleNamespace(id="turn"))
 
     runtime.client = Client()
-    session, model = await runtime.prepare(
-        "thread", Profile("quick", model="fixture-model"), "auto", ""
-    )
+    session, model = await runtime.prepare("thread", "fixture-model", "auto", "")
     assert (session, model) == ("thread", "fixture-model")
-    for mode in ("plan", "auto"):
-        await runtime.turn(
-            "thread", "hello", mode, Profile("quick"), "fixture-model", empty(tmp_path)
-        )
+    runtime.models = AsyncMock(
+        return_value=[
+            {
+                "id": "fixture-model",
+                "default_effort": "medium",
+                "supported_efforts": ["medium", "ultra"],
+            }
+        ]
+    )
+    for mode, effort in (("plan", None), ("auto", "ultra")):
+        await runtime.turn("thread", "hello", mode, effort, "fixture-model", empty(tmp_path))
     assert all(
         c["approvalsReviewer"] == "auto_review" and c["approvalPolicy"] == "on-request"
         for c in calls
@@ -46,6 +51,9 @@ async def test_forced_policy(tmp_path):
     assert calls[0]["collaborationMode"]["mode"] == "plan"
     assert calls[1]["sandboxPolicy"]["networkAccess"]
     assert calls[1]["model"] == "fixture-model"
+    assert calls[0]["collaborationMode"]["settings"]["reasoning_effort"] == "medium"
+    assert calls[1]["collaborationMode"]["settings"]["reasoning_effort"] == "ultra"
+    assert all(c["collaborationMode"]["settings"]["developer_instructions"] is None for c in calls)
     assert str(tmp_path / ".agents/skills") in calls[1]["sandboxPolicy"]["writableRoots"]
 
 
@@ -63,6 +71,10 @@ async def test_model_catalog(tmp_path):
                         display_name="Model",
                         is_default=not params["cursor"],
                         hidden=False,
+                        default_reasoning_effort=SimpleNamespace(value="medium"),
+                        supported_reasoning_efforts=[
+                            SimpleNamespace(reasoning_effort=SimpleNamespace(value="medium"))
+                        ],
                     ),
                     SimpleNamespace(hidden=True),
                 ],
@@ -90,3 +102,20 @@ def test_resource_layout(tmp_path):
     (settings.codex_home / "skills").mkdir()
     with pytest.raises(ValueError, match="冲突"):
         prepare_home(settings)
+
+
+async def test_delete_errors(tmp_path):
+    from unittest.mock import Mock
+
+    from openai_codex.errors import InvalidRequestError
+
+    runtime = Runtime(Settings(workspace=tmp_path))
+    runtime.client = SimpleNamespace(
+        request=Mock(side_effect=InvalidRequestError(-32600, "permission denied"))
+    )
+    with pytest.raises(InvalidRequestError):
+        await runtime.delete_thread("session")
+    runtime.client.request.side_effect = InvalidRequestError(
+        -32600, "no rollout found for thread id session"
+    )
+    await runtime.delete_thread("session")

@@ -18,6 +18,7 @@ class Settings:
     db_path: Path = field(
         default_factory=lambda: Path("~/.local/state/antares-codex/antares.db").expanduser()
     )
+    # Legacy private files remain sandbox-protected.
     profiles_dir: Path = field(
         default_factory=lambda: Path("~/.local/state/antares-codex/profiles").expanduser()
     )

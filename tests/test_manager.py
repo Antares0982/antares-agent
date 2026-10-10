@@ -103,3 +103,115 @@ async def test_the_reaper_can_be_turned_off(tmp_path: Path, ttl: int) -> None:
 
     assert await manager.reap_idle() == []
     assert "thr_ancient" in manager._live
+
+
+async def test_expired_cleanup(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock
+
+    from antares_agent.events import Event, EventType
+
+    manager = make(tmp_path, ttl=60)
+    manager.runtime.delete_thread = AsyncMock(side_effect=RuntimeError("offline"))
+    cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="milliseconds")
+    for thread in ("old", "busy", "recent", "legacy", "transfer"):
+        manager.store.create_thread(thread, "default", "7")
+    for thread in ("old", "busy", "legacy", "transfer"):
+        manager.store._db.execute(
+            "UPDATE threads SET last_active_at=? WHERE thread_id=?", (cutoff, thread)
+        )
+    manager.store._db.commit()
+    manager.store.touch("old", session_id="session", activity=False)
+    manager.store.append_event(Event(EventType.TEXT, "old", {"content": "secret"}).with_id(1))
+    manager.store.begin_request("request", "old", "hash")
+    manager._live["busy"] = FakeRunner(busy=True)
+    source = tmp_path / "work" / "keep.txt"
+    source.write_text("work survives")
+    old_artifact = await manager.artifacts.collect("old", source)
+    active_artifact = await manager.artifacts.collect("transfer", source)
+    manager.artifacts.active.add(active_artifact["id"])
+    assert await manager.purge_expired() == ["legacy"]
+    assert manager.store.get_thread("old") is None
+    assert manager.store.events_since("old", 0)
+    assert manager.store.get_thread("busy") is not None
+    assert manager.store.get_thread("recent") is not None
+    assert manager.store.get_thread("transfer") is not None
+    manager.runtime.delete_thread.side_effect = None
+    assert await manager.purge_expired() == ["old"]
+    assert not manager.store.events_since("old", 0)
+    assert manager.store.request("request") is None
+    assert not manager.artifacts.path(old_artifact["id"]).exists()
+    assert manager.artifacts.get(old_artifact["id"]) is None
+    assert source.read_text() == "work survives"
+    assert manager.runtime.delete_thread.await_count == 2
+    assert await manager.purge_expired() == []
+    manager.artifacts.close()
+    manager.store.close()
+
+
+async def test_retirement_activity(tmp_path):
+    manager = make(tmp_path, ttl=60)
+    park(manager, "old", idle_for=120)
+    before = manager.store.get_thread("old").last_active_at
+    await manager.reap_idle()
+    assert manager.store.get_thread("old").last_active_at == before
+    manager.artifacts.close()
+    manager.store.close()
+
+
+async def test_cleanup_lock(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    manager = make(tmp_path, ttl=60)
+    manager.store.create_thread("old", "default")
+    manager.store._db.execute("UPDATE threads SET last_active_at='2000-01-01T00:00:00.000+00:00'")
+    manager.store._db.commit()
+    async with manager.activity_lock:
+        task = asyncio.create_task(manager.purge_expired())
+        await asyncio.sleep(0)
+        assert not task.done()
+        manager.store.touch("old")
+    assert await task == []
+    manager.runtime.delete_thread = AsyncMock()
+    manager.store.mark_deleting("old")
+    assert await manager.purge_expired() == ["old"]
+    manager.runtime.delete_thread.assert_not_awaited()
+    manager.artifacts.close()
+    manager.store.close()
+
+
+async def test_retention_boundary(tmp_path):
+    manager = make(tmp_path, ttl=60)
+    for thread, stamp in (
+        ("expired", "2026-01-01T00:00:00.000+00:00"),
+        ("recent", "2026-01-01T00:00:00.001+00:00"),
+    ):
+        manager.store.create_thread(thread, "default")
+        manager.store._db.execute(
+            "UPDATE threads SET last_active_at=? WHERE thread_id=?", (stamp, thread)
+        )
+    manager.store._db.commit()
+    assert [
+        row.thread_id for row in manager.store.expired_threads("2026-01-01T00:00:00.000+00:00")
+    ] == ["expired"]
+    manager.artifacts.close()
+    manager.store.close()
+
+
+async def test_cleanup_refresh(tmp_path):
+    from unittest.mock import AsyncMock
+
+    manager = make(tmp_path, ttl=60)
+    for thread in ("first", "finished"):
+        manager.store.create_thread(thread, "default")
+        manager.store.touch(thread, session_id=thread)
+    manager.store._db.execute("UPDATE threads SET last_active_at='2000-01-01T00:00:00.000+00:00'")
+    manager.store._db.commit()
+    manager.runtime.delete_thread = AsyncMock(
+        side_effect=lambda session: manager.store.touch("finished")
+    )
+    assert await manager.purge_expired() == ["first"]
+    assert manager.store.get_thread("finished") is not None
+    manager.artifacts.close()
+    manager.store.close()

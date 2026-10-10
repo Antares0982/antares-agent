@@ -6,10 +6,12 @@ import logging
 import shutil
 
 from openai_codex.client import CodexClient, CodexConfig
+from openai_codex.errors import InvalidRequestError
 from openai_codex.generated.v2_all import (
     ModelListResponse,
     SkillsExtraRootsSetResponse,
     SkillsListResponse,
+    ThreadArchiveResponse,
     ThreadUnsubscribeResponse,
 )
 
@@ -121,6 +123,23 @@ class Runtime:
         except Exception:
             log.warning("Codex notification stream closed")
 
+    async def delete_thread(self, session: str) -> None:
+        client = await self.start()
+        try:
+            await asyncio.to_thread(
+                client.request,
+                "thread/delete",
+                {"threadId": session},
+                response_model=ThreadArchiveResponse,
+            )
+        except InvalidRequestError as exc:
+            if exc.message not in {
+                f"thread not found: {session}",
+                f"no rollout found for thread id {session}",
+            }:
+                raise
+        self.usage.pop(session, None)
+
     async def models(self):
         try:
             client = await self.start()
@@ -138,6 +157,10 @@ class Runtime:
                         "id": item.model,
                         "name": item.display_name,
                         "is_default": item.is_default,
+                        "default_effort": item.default_reasoning_effort.value,
+                        "supported_efforts": [
+                            e.reasoning_effort.value for e in item.supported_reasoning_efforts
+                        ],
                     }
                     for item in page.data
                     if not item.hidden
@@ -183,17 +206,18 @@ class Runtime:
             "writableRoots": [str(self.settings.workspace), *map(str, roots)],
         }
 
-    async def prepare(self, session, profile, mode, instructions):
+    async def prepare(self, session, model, mode, instructions):
         client = await self.start()
         options = {
             "cwd": str(self.settings.workspace),
             "sandbox": "read-only" if mode == "plan" else "workspace-write",
             "approvalPolicy": "on-request",
             "approvalsReviewer": "auto_review",
+            # Restore initial instructions after compaction and restart.
             "developerInstructions": instructions,
         }
-        if profile.model:
-            options["model"] = profile.model
+        if model:
+            options["model"] = model
         if session:
             result = await asyncio.to_thread(client.thread_resume, session, options)
         else:
@@ -201,11 +225,16 @@ class Runtime:
         if result.approvals_reviewer.value != "auto_review":
             raise RuntimeError("Codex 自动审批未生效")
         self.default_model = result.model
-        return result.thread.id, profile.model or result.model
+        return result.thread.id, model or result.model
 
-    async def turn(self, session, inputs, mode, profile, model, manifest):
+    async def turn(self, session, inputs, mode, effort, model, manifest):
         client = await self.start()
         self.usage.pop(session, None)
+        info = next((item for item in await self.models() if item["id"] == model), None)
+        if info is None:
+            raise ModelsUnavailable("模型不可用，请使用 /model 重新选择")
+        if effort is not None and effort not in info["supported_efforts"]:
+            raise ValueError("当前模型不支持该 effort，请使用 /effort 重新选择")
         options = {
             "model": model,
             "approvalPolicy": "on-request",
@@ -215,7 +244,7 @@ class Runtime:
                 "mode": "plan" if mode == "plan" else "default",
                 "settings": {
                     "model": model,
-                    "reasoning_effort": profile.effort,
+                    "reasoning_effort": effort if effort is not None else info["default_effort"],
                     "developer_instructions": None,
                 },
             },

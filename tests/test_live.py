@@ -16,7 +16,6 @@ import uvicorn
 
 from antares_agent.api import create_app
 from antares_agent.config import Settings
-from antares_agent.profiles import Profile
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ANTARES_LIVE") != "1",
@@ -93,11 +92,6 @@ def client(
         server.should_exit = True
         pytest.fail("server did not come up")
 
-    model = os.environ.get("ANTARES_LIVE_MODEL")
-    app.state.manager.profiles["quick"] = Profile(
-        name="quick", permission_mode="auto", effort="low", model=model
-    )
-
     with httpx.Client(base_url=base, timeout=TIMEOUT_S) as c:
         yield c
 
@@ -123,7 +117,10 @@ def drain(client: httpx.Client, thread_id: str, until: str) -> list[dict[str, An
 
 
 def test_a_real_turn_edits_a_file_and_reports_a_diff(client: httpx.Client, workspace: Path) -> None:
-    thread_id = client.post("/v1/threads", json={"profile": "quick"}).json()["thread_id"]
+    thread_id = client.post(
+        "/v1/threads",
+        json={"profile": "auto", "model": os.environ.get("ANTARES_LIVE_MODEL"), "effort": "low"},
+    ).json()["thread_id"]
 
     assert (workspace / ".agent" / "workspace-index.md").exists()
     assert "workspace-index.md" in (workspace / "AGENTS.md").read_text(encoding="utf-8")
@@ -153,7 +150,10 @@ def test_a_real_turn_edits_a_file_and_reports_a_diff(client: httpx.Client, works
 
 
 def test_sandboxed_reads_are_silent_but_still_reported(client: httpx.Client) -> None:
-    thread_id = client.post("/v1/threads", json={"profile": "quick"}).json()["thread_id"]
+    thread_id = client.post(
+        "/v1/threads",
+        json={"profile": "auto", "model": os.environ.get("ANTARES_LIVE_MODEL"), "effort": "low"},
+    ).json()["thread_id"]
     client.post(
         f"/v1/threads/{thread_id}/messages",
         json={"text": "用 Bash 跑 `ls api/` 并告诉我结果。"},

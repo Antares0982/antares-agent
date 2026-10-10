@@ -20,7 +20,12 @@ from pathlib import Path
 
 from .events import Event, EventType
 
+UNSET = object()
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_prompts (
+    chat_id TEXT PRIMARY KEY, prompt TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS requests (
     id TEXT PRIMARY KEY, thread TEXT NOT NULL, fingerprint TEXT NOT NULL,
     state TEXT NOT NULL, result TEXT
@@ -34,6 +39,7 @@ CREATE TABLE IF NOT EXISTS threads (
     last_active_at TEXT NOT NULL,
     permission_mode TEXT NOT NULL DEFAULT '',
     model          TEXT,
+    chat_id        TEXT,
     deleted        INTEGER NOT NULL DEFAULT 0
 );
 
@@ -62,6 +68,9 @@ class ThreadRow:
     last_active_at: str
     permission_mode: str = ""
     model: str | None = None
+    chat_id: str | None = None
+    effort: str | None = None
+    prompt: str = ""
 
 
 class Store:
@@ -79,7 +88,34 @@ class Store:
             )
         if "model" not in columns:
             self._db.execute("ALTER TABLE threads ADD COLUMN model TEXT")
+        if "chat_id" not in columns:
+            self._db.execute("ALTER TABLE threads ADD COLUMN chat_id TEXT")
+        if "prompt" not in columns:
+            self._db.execute("ALTER TABLE threads ADD COLUMN prompt TEXT NOT NULL DEFAULT ''")
+        if "effort" not in columns:
+            self._db.execute("ALTER TABLE threads ADD COLUMN effort TEXT")
+        self._db.execute(
+            "UPDATE threads SET profile=CASE profile "
+            "WHEN 'quick' THEN 'auto' WHEN 'deep' THEN 'plan' "
+            "ELSE CASE WHEN permission_mode='plan' THEN 'plan' ELSE 'auto' END END "
+            "WHERE profile NOT IN ('auto','plan')"
+        )
         self._db.commit()
+
+    def get_prompt(self, chat_id: str | None) -> str:
+        row = self._db.execute(
+            "SELECT prompt FROM chat_prompts WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        return row[0] if row else ""
+
+    def set_prompt(self, chat_id: str, text: str) -> None:
+        with self._db:
+            if text:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO chat_prompts VALUES (?,?)", (chat_id, text)
+                )
+            else:
+                self._db.execute("DELETE FROM chat_prompts WHERE chat_id=?", (chat_id,))
 
     def close(self) -> None:
         self._db.close()
@@ -125,15 +161,17 @@ class Store:
 
     # -- threads ---------------------------------------------------------
 
-    def create_thread(self, thread_id: str, profile: str) -> ThreadRow:
+    def create_thread(
+        self, thread_id: str, profile: str, chat_id: str | None = None, prompt: str = ""
+    ) -> ThreadRow:
         now = _now()
         self._db.execute(
             "INSERT INTO threads (thread_id, profile, session_id, summary, created_at, "
-            "last_active_at) VALUES (?, ?, NULL, '', ?, ?)",
-            (thread_id, profile, now, now),
+            "last_active_at, chat_id, prompt) VALUES (?, ?, NULL, '', ?, ?, ?, ?)",
+            (thread_id, profile, now, now, chat_id, prompt),
         )
         self._db.commit()
-        return ThreadRow(thread_id, profile, None, "", now, now)
+        return ThreadRow(thread_id, profile, None, "", now, now, chat_id=chat_id, prompt=prompt)
 
     def get_thread(self, thread_id: str) -> ThreadRow | None:
         row = self._db.execute(
@@ -141,10 +179,11 @@ class Store:
         ).fetchone()
         return _row(row) if row else None
 
-    def list_threads(self, limit: int = 100) -> list[ThreadRow]:
+    def list_threads(self, limit: int = 100, chat_id: str | None = None) -> list[ThreadRow]:
         rows = self._db.execute(
-            "SELECT * FROM threads WHERE deleted = 0 ORDER BY last_active_at DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM threads WHERE deleted = 0 AND chat_id IS ? "
+            "ORDER BY last_active_at DESC LIMIT ?",
+            (chat_id, limit),
         ).fetchall()
         return [_row(r) for r in rows]
 
@@ -156,6 +195,8 @@ class Store:
         summary: str = "",
         permission_mode: str | None = None,
         model: str | None = None,
+        activity: bool = True,
+        effort: str | object | None = UNSET,
     ) -> None:
         """Bump activity, and record whatever new identity the thread gained.
 
@@ -163,13 +204,24 @@ class Store:
         later call with nothing new must not blank what is already there.
         """
         self._db.execute(
-            "UPDATE threads SET last_active_at = ?, "
+            "UPDATE threads SET last_active_at = CASE WHEN ? THEN ? ELSE last_active_at END, "
             "session_id = COALESCE(?, session_id), "
             "summary = CASE WHEN summary = '' THEN ? ELSE summary END, "
             "permission_mode = COALESCE(?, permission_mode), "
-            "model = COALESCE(?, model) "
+            "model = COALESCE(?, model), "
+            "effort = CASE WHEN ? THEN ? ELSE effort END "
             "WHERE thread_id = ?",
-            (_now(), session_id, summary, permission_mode, model, thread_id),
+            (
+                activity,
+                _now(),
+                session_id,
+                summary,
+                permission_mode,
+                model,
+                effort is not UNSET,
+                None if effort is UNSET else effort,
+                thread_id,
+            ),
         )
         self._db.commit()
 
@@ -177,6 +229,25 @@ class Store:
         """Soft delete: the row stays so a stale id keeps 404-ing after a restart."""
         self._db.execute("UPDATE threads SET deleted = 1 WHERE thread_id = ?", (thread_id,))
         self._db.commit()
+
+    def active_threads(self) -> list[ThreadRow]:
+        return [_row(row) for row in self._db.execute("SELECT * FROM threads WHERE deleted=0")]
+
+    def expired_threads(self, cutoff: str) -> list[ThreadRow]:
+        rows = self._db.execute(
+            "SELECT * FROM threads WHERE deleted=2 OR last_active_at<=?", (cutoff,)
+        ).fetchall()
+        return [_row(row) for row in rows]
+
+    def mark_deleting(self, thread_id: str) -> None:
+        self._db.execute("UPDATE threads SET deleted=2 WHERE thread_id=?", (thread_id,))
+        self._db.commit()
+
+    def purge_thread(self, thread_id: str) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM events WHERE thread_id=?", (thread_id,))
+            self._db.execute("DELETE FROM requests WHERE thread=?", (thread_id,))
+            self._db.execute("DELETE FROM threads WHERE thread_id=?", (thread_id,))
 
     # -- events ----------------------------------------------------------
 
@@ -233,4 +304,7 @@ def _row(row: sqlite3.Row) -> ThreadRow:
         last_active_at=row["last_active_at"],
         permission_mode=row["permission_mode"],
         model=row["model"],
+        chat_id=row["chat_id"],
+        effort=row["effort"],
+        prompt=row["prompt"],
     )

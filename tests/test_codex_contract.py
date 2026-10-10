@@ -16,7 +16,7 @@ from openai_codex.generated.v2_all import (
 
 from antares_agent.config import Settings
 from antares_agent.preflight import check_sandbox
-from antares_agent.runtime import runtime_config
+from antares_agent.runtime import Runtime, runtime_config
 
 pytestmark = pytest.mark.skipif(os.getenv("ANTARES_CONTRACT") != "1", reason="real CLI opt-in")
 
@@ -200,3 +200,131 @@ def test_managed_sandbox(tmp_path):
             timeout=60,
         )
         assert result.returncode == 0, result.stderr
+
+
+async def test_delete_contract(tmp_path):
+    from openai_codex.errors import InvalidRequestError
+    from openai_codex.generated.v2_all import ThreadReadResponse
+
+    work = tmp_path / "work"
+    work.mkdir()
+    runtime = Runtime(Settings(workspace=work, codex_home=tmp_path / "codex"))
+    client = await runtime.start()
+    try:
+        started = client.thread_start({"cwd": str(work), "persistExtendedHistory": True})
+        session = started.thread.id
+        await runtime.delete_thread(session)
+        with pytest.raises(InvalidRequestError):
+            client.request("thread/read", {"threadId": session}, response_model=ThreadReadResponse)
+        await runtime.delete_thread(session)
+        assert work.is_dir()
+    finally:
+        await runtime.close()
+
+
+async def test_initial_prompt_contract(tmp_path):
+    import asyncio
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    from antares_agent.manifest import empty
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            events = [
+                {"type": "response.created", "response": {"id": "probe"}},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "id": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fixture response"}],
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "probe",
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    },
+                },
+            ]
+            body = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    settings = Settings(workspace=tmp_path, codex_home=tmp_path / "codex")
+    settings.codex_home.mkdir()
+    config = runtime_config(settings)
+    config = replace(
+        config,
+        config_overrides=(
+            *config.config_overrides,
+            'model_provider="fixture"',
+            'model_providers.fixture.name="Local probe"',
+            f'model_providers.fixture.base_url="http://127.0.0.1:{server.server_port}"',
+            'model_providers.fixture.wire_api="responses"',
+            "model_providers.fixture.requires_openai_auth=false",
+            "model_providers.fixture.supports_websockets=false",
+            "model_providers.fixture.request_max_retries=0",
+            "model_providers.fixture.stream_max_retries=0",
+        ),
+    )
+    runtime = Runtime(settings)
+    try:
+        runtime.client = CodexClient(config, runtime.handle_request)
+        await asyncio.to_thread(runtime.client.start)
+        await asyncio.to_thread(runtime.client.initialize)
+        models = await runtime.models()
+        info = next(m for m in models if m["is_default"])
+        session = None
+        for index in range(3):
+            if index == 2:
+                await runtime.close()
+                runtime.client = CodexClient(config, runtime.handle_request)
+                await asyncio.to_thread(runtime.client.start)
+                await asyncio.to_thread(runtime.client.initialize)
+            session, model = await runtime.prepare(session, info["id"], "auto", "INITIAL_PROMPT")
+            turn = await runtime.turn(session, "hello", "auto", None, model, empty(tmp_path))
+            while True:
+                notification = await asyncio.to_thread(
+                    runtime.client.next_turn_notification, turn.turn.id
+                )
+                if notification.method == "turn/completed":
+                    assert notification.payload.turn.status.value == "completed"
+                    break
+            runtime.client.unregister_turn_notifications(turn.turn.id)
+            if index == 1:
+                await asyncio.to_thread(runtime.client.thread_compact, session)
+                async with asyncio.timeout(20):
+                    while True:
+                        read = await asyncio.to_thread(runtime.client.thread_read, session, True)
+                        latest = read.thread.turns[-1]
+                        if latest.id != turn.turn.id and latest.status.value == "completed":
+                            break
+                        await asyncio.sleep(0.05)
+            await runtime.release(session)
+        assert len(requests) == 4
+        for request in requests:
+            text = json.dumps(request["input"])
+            assert text.count("INITIAL_PROMPT") == 1, [
+                json.dumps(r["input"]).count("INITIAL_PROMPT") for r in requests
+            ]
+    finally:
+        await runtime.close()
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        server_thread.join()

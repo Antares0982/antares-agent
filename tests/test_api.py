@@ -62,10 +62,17 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         async def set_permission_mode(self, mode: str) -> None:
             self.mode = mode
 
-        async def set_model(self, model: str) -> None:
+        async def set_model(self, model: str, effort: str | None = None) -> None:
             if self.busy:
                 raise ValueError("会话正在执行")
-            self.persist_model(model)
+            self.state.effort = effort
+            self.persist_model(model, effort)
+
+        async def set_effort(self, effort):
+            if self.busy:
+                raise ValueError("会话正在执行")
+            self.state.effort = effort
+            self.persist_model(None, effort)
 
         async def close(self) -> None: ...
 
@@ -85,7 +92,10 @@ def client(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         event_log._next_id = self.store.last_event_id(thread_id) + 1
         self._logs[thread_id] = event_log
         runner = FakeRunner(thread_id, event_log)
-        runner.persist_model = lambda model: self.store.touch(thread_id, model=model)
+        runner.state.effort = self.store.get_thread(thread_id).effort
+        runner.persist_model = lambda model, effort: self.store.touch(
+            thread_id, model=model, effort=effort
+        )
         self._live[thread_id] = runner
         started.append(runner)
         return runner
@@ -111,12 +121,12 @@ def new_thread(client: TestClient, profile: str | None = None) -> str:
 def test_health_lists_profiles(client: TestClient) -> None:
     body = client.get("/v1/health").json()
     assert body["status"] == "ok"
-    assert "quick" in body["profiles"] and "deep" in body["profiles"]
+    assert "auto" in body["profiles"] and "plan" in body["profiles"]
 
 
-def test_builtin_profiles_are_written_to_disk(client: TestClient, settings: Settings) -> None:
-    assert (settings.profiles_dir / "deep.toml").exists()
-    assert 'permission_mode = "plan"' in (settings.profiles_dir / "deep.toml").read_text()
+def test_fixed_profiles(client: TestClient, settings: Settings) -> None:
+    assert not settings.profiles_dir.exists()
+    assert {p["name"] for p in client.get("/v1/profiles").json()["profiles"]} == {"auto", "plan"}
 
 
 def test_unknown_profile_is_rejected(client: TestClient) -> None:
@@ -127,8 +137,20 @@ def test_model_selection(client: TestClient, settings: Settings, monkeypatch) ->
     from antares_agent.runtime import ModelsUnavailable
 
     models = [
-        {"id": "model-a", "name": "A", "is_default": True},
-        {"id": "model-b", "name": "B", "is_default": False},
+        {
+            "id": "model-a",
+            "name": "A",
+            "is_default": True,
+            "default_effort": "medium",
+            "supported_efforts": ["low", "medium", "high"],
+        },
+        {
+            "id": "model-b",
+            "name": "B",
+            "is_default": False,
+            "default_effort": "high",
+            "supported_efforts": ["medium", "high", "ultra"],
+        },
     ]
     catalog = AsyncMock(return_value=models)
     monkeypatch.setattr(client.app.state.manager.runtime, "models", catalog)
@@ -377,7 +399,7 @@ def test_startup_recovers_busy(settings: Settings, monkeypatch: pytest.MonkeyPat
     # through `/events/replay`, which is the only endpoint the bot uses after a
     # restart -- writing it anywhere the client does not look would be no fix.
     store = Store(settings.db_path)
-    store.create_thread("thr_x", "quick")
+    store.create_thread("thr_x", "auto")
     for n, (type_, data) in enumerate(
         [
             (EventType.TEXT, {"content": "处理中"}),
@@ -400,7 +422,7 @@ def test_startup_recovers_busy(settings: Settings, monkeypatch: pytest.MonkeyPat
 def test_event_ids_continue_across_a_restart(settings: Settings) -> None:
     store = Store(settings.db_path)
     try:
-        store.create_thread("thr_x", "quick")
+        store.create_thread("thr_x", "auto")
         store.append_event(
             Event(type=EventType.TEXT, thread_id="thr_x", data={"content": "a"}).with_id(7)
         )
@@ -454,3 +476,113 @@ def test_uncertain_requests(client: TestClient) -> None:
     response = client.post(f"/v1/threads/{thread_id}/messages", json=body.model_dump())
     assert response.status_code == 409
     assert not client.started
+
+
+def test_chat_isolation(client):
+    ids = {}
+    for chat in ("7", "8"):
+        response = client.post("/v1/threads", json={"chat_id": chat})
+        assert response.status_code == 201
+        ids[chat] = response.json()["thread_id"]
+    legacy = new_thread(client)
+    listed = client.get("/v1/threads", params={"chat_id": "7"}).json()["threads"]
+    assert [row["thread_id"] for row in listed] == [ids["7"]]
+    assert listed[0]["chat_id"] == "7"
+    for thread in (ids["8"], legacy):
+        for method, suffix, body in (
+            ("GET", "", None),
+            ("GET", "/events", None),
+            ("GET", "/events/replay", None),
+            ("DELETE", "", None),
+            ("POST", "/messages", {"text": "secret"}),
+            ("POST", "/interrupt", {}),
+            ("POST", "/mode", {"mode": "plan"}),
+            ("POST", "/model", {"model": None}),
+            ("PUT", "/attachments/" + "a" * 32, {}),
+        ):
+            response = client.request(
+                method, f"/v1/threads/{thread}{suffix}", params={"chat_id": "7"}, json=body
+            )
+            assert response.status_code == 404
+            assert "summary" not in response.json()
+    assert client.get(f"/v1/threads/{ids['7']}").status_code == 404
+    assert client.get(f"/v1/threads/{ids['7']}", params={"chat_id": "7"}).status_code == 200
+    assert (
+        client.post(
+            f"/v1/threads/{ids['7']}/messages", params={"chat_id": "7"}, json={"text": "own"}
+        ).status_code
+        == 202
+    )
+    store = Store(client.app.state.settings.db_path)
+    assert store.get_thread(ids["7"]).chat_id == "7"
+    store.close()
+
+
+def test_effort_and_prompt(client, settings, monkeypatch):
+    catalog = [
+        {
+            "id": "a",
+            "is_default": True,
+            "default_effort": "medium",
+            "supported_efforts": ["low", "medium"],
+        },
+        {
+            "id": "b",
+            "is_default": False,
+            "default_effort": "high",
+            "supported_efforts": ["high", "ultra"],
+        },
+    ]
+    mgr = client.app.state.manager
+    monkeypatch.setattr(mgr.runtime, "models", AsyncMock(return_value=catalog))
+    assert client.post("/v1/chats/-7/prompt", json={"text": "偏好甲\n多行"}).status_code == 200
+    thread = client.post(
+        "/v1/threads", json={"chat_id": "-7", "profile": "plan", "effort": "low"}
+    ).json()
+    tid = thread["thread_id"]
+    assert (thread["permission_mode"], thread["model"], thread["effort"]) == ("plan", "a", "low")
+    assert mgr.store.get_thread(tid).prompt == "偏好甲\n多行"
+    path = f"/v1/threads/{tid}"
+    assert (
+        client.post(
+            path + "/effort", params={"chat_id": "8"}, json={"effort": "medium"}
+        ).status_code
+        == 404
+    )
+    params = {"chat_id": "-7"}
+    assert client.post(path + "/effort", params=params, json={"effort": "ultra"}).status_code == 400
+    assert (
+        client.post(path + "/effort", params=params, json={"effort": None}).json()["effort"] is None
+    )
+    assert client.post(path + "/effort", params=params, json={"effort": "low"}).status_code == 200
+    client.started[-1].busy = True
+    assert client.post(path + "/effort", params=params, json={"effort": None}).status_code == 409
+    assert mgr.store.get_thread(tid).effort == "low"
+    client.started[-1].busy = False
+    changed = client.post(path + "/model", params=params, json={"model": "b"}).json()
+    assert changed["effort"] is None and changed["effort_reset"]
+    assert client.post(path + "/effort", params=params, json={"effort": "ultra"}).status_code == 200
+    assert (
+        client.post(path + "/model", params=params, json={"model": "b"}).json()["effort"] == "ultra"
+    )
+    assert client.post(path + "/effort", params=params, json={"effort": None}).status_code == 200
+    assert client.post("/v1/chats/-7/prompt", json={"text": "偏好乙"}).status_code == 200
+    assert mgr.store.get_thread(tid).prompt == "偏好甲\n多行"
+    other = client.post("/v1/threads", json={"chat_id": "8"}).json()["thread_id"]
+    assert mgr.store.get_thread(other).prompt == ""
+    next_thread = client.post(
+        "/v1/threads", json={"chat_id": "-7", "model": "b", "effort": "low"}
+    ).json()
+    assert next_thread["effort_reset"] and next_thread["effort"] is None
+    assert mgr.store.get_thread(next_thread["thread_id"]).prompt == "偏好乙"
+    assert client.post("/v1/chats/-7/prompt", json={"text": ""}).status_code == 200
+    cleared = client.post("/v1/threads", json={"chat_id": "-7"}).json()["thread_id"]
+    assert mgr.store.get_thread(cleared).prompt == ""
+    assert client.get("/v1/chats/8/prompt").json()["text"] == ""
+    for text in (" ", "x" * 4001, "bad\x00text", 7):
+        assert client.post("/v1/chats/-7/prompt", json={"text": text}).status_code == 422
+    assert client.post("/v1/chats/not-chat/prompt", json={"text": "x"}).status_code == 422
+    reopened = Store(settings.db_path)
+    assert reopened.get_thread(tid).effort is None
+    assert reopened.get_thread(tid).prompt == "偏好甲\n多行"
+    reopened.close()

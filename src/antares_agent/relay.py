@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import ssl
 import time
@@ -172,6 +173,7 @@ class Relay:
                 log.warning("undecodable command: %.100s", message.body)
                 return
             try:
+                chat_id(cmd)
                 if self.transfers is not None and cmd.get("op") == "message":
                     self.transfers.enqueue(cmd)
                 else:
@@ -187,38 +189,87 @@ class Relay:
                         "chat_id": cmd.get("chat_id"),
                         "thread_id": cmd.get("thread_id"),
                         "detail": str(exc),
+                        "status": getattr(exc, "status", None),
                     },
                 )
 
     # -- commands --------------------------------------------------------
 
     async def _dispatch(self, cmd: dict[str, Any]) -> None:
+        chat = chat_id(cmd)
         op = cmd.get("op")
         thread_id = cmd.get("thread_id")
 
         if op == "new_thread":
-            body = {"profile": cmd.get("profile")} if cmd.get("profile") else {}
+            body = {"chat_id": chat}
+            if cmd.get("profile"):
+                body["profile"] = cmd["profile"]
             if cmd.get("model") is not None:
                 body["model"] = cmd["model"]
-            await self._bind(await self._post("/v1/threads", body), cmd.get("chat_id"))
+            if cmd.get("effort") is not None:
+                body["effort"] = cmd["effort"]
+            thread = await self._post("/v1/threads", body)
+            if thread.get("effort_reset"):
+                models = (await self._get("/v1/models"))["models"]
+                info = next(m for m in models if m["id"] == thread["model"])
+                thread["default_effort"] = info["default_effort"]
+            await self._bind(thread, cmd.get("chat_id"))
             return
 
-        if op == "models":
+        if op == "prompt":
+            path = f"/v1/chats/{chat}/prompt"
+            reply = (
+                await self._post(path, {"text": cmd["text"]})
+                if "text" in cmd
+                else await self._get(path)
+            )
+            await self._publish("relay.prompt", reply)
+            return
+
+        if op in {"models", "efforts"}:
             reply = await self._get("/v1/models")
+            models = reply["models"]
             current = None
             if thread_id:
-                if "select" in cmd:
+                if "select" in cmd and op == "models":
                     current = await self._post(
                         f"/v1/threads/{thread_id}/model",
                         {"model": None if cmd["select"] == "default" else cmd["select"]},
+                        chat_id=chat,
                     )
                 else:
-                    current = await self._get(f"/v1/threads/{thread_id}")
+                    current = await self._get(f"/v1/threads/{thread_id}", chat_id=chat)
+            selected_model = current.get("model") if current else cmd.get("model")
+            if op == "models" and "select" in cmd:
+                selected_model = cmd["select"]
+            if selected_model == "default":
+                selected_model = None
+            info = next(
+                (
+                    m
+                    for m in models
+                    if m["id"] == selected_model or (selected_model is None and m["is_default"])
+                ),
+                None,
+            )
+            if info is None:
+                raise ValueError("模型不可用，请使用 /model 重新选择")
+            if op == "efforts" and "select" in cmd:
+                effort = None if cmd["select"] == "default" else cmd["select"]
+                if effort is not None and effort not in info["supported_efforts"]:
+                    raise ValueError("当前模型不支持该 effort，请使用 /effort 重新选择")
+                if thread_id:
+                    current = await self._post(
+                        f"/v1/threads/{thread_id}/effort",
+                        {"effort": effort},
+                        chat_id=chat,
+                    )
             await self._publish(
-                "relay.models",
+                "relay." + op,
                 {
                     "chat_id": cmd["chat_id"],
-                    "models": reply["models"],
+                    "models": models,
+                    "model": info,
                     "current": current,
                     **({"select": cmd["select"]} if "select" in cmd else {}),
                 },
@@ -226,7 +277,7 @@ class Relay:
             return
 
         if op == "list":
-            reply = await self._get("/v1/threads")
+            reply = await self._get("/v1/threads", chat_id=chat)
             await self._publish(
                 THREAD_LIST, {"chat_id": cmd.get("chat_id"), "threads": reply["threads"]}
             )
@@ -247,31 +298,43 @@ class Relay:
                         "attachments": cmd.get("attachments") or [],
                         **({"request_id": cmd["request_id"]} if "request_id" in cmd else {}),
                     },
+                    chat_id=chat,
                 )
-                self._follow(thread_id, cmd.get("after"))
+                self._follow(thread_id, cmd.get("after"), chat)
             case "interrupt":
-                await self._post(f"/v1/threads/{thread_id}/interrupt", {})
+                await self._post(f"/v1/threads/{thread_id}/interrupt", {}, chat_id=chat)
             case "mode":
-                await self._post(f"/v1/threads/{thread_id}/mode", {"mode": cmd["mode"]})
+                await self._post(
+                    f"/v1/threads/{thread_id}/mode", {"mode": cmd["mode"]}, chat_id=chat
+                )
             case "resume":
-                await self._resume(thread_id, cmd.get("after"))
+                await self._resume(thread_id, cmd.get("after"), chat)
             case "switch":
                 # Reads the thread rather than trusting the id: a typo would
                 # otherwise bind the chat to something that does not exist, and
                 # every later command would fail one at a time instead of once.
                 # This endpoint does not wake the thread (manager.status only
                 # reads the live map).
-                await self._bind(await self._get(f"/v1/threads/{thread_id}"), cmd.get("chat_id"))
+                await self._bind(
+                    await self._get(f"/v1/threads/{thread_id}", chat_id=chat), cmd.get("chat_id")
+                )
             case _:
                 raise ValueError(f"unknown op {op!r}")
 
     async def _bind(self, thread: dict[str, Any], chat_id: Any) -> None:
+        if thread.get("chat_id") != str(chat_id):
+            raise RelayError(404, "会话不存在或无权访问")
         await self._publish(
             THREAD_BOUND,
             {
                 "chat_id": chat_id,
                 "thread_id": thread["thread_id"],
+                "owner_chat_id": thread["chat_id"],
                 "profile": thread.get("profile"),
+                "model": thread.get("model"),
+                "effort": thread.get("effort"),
+                "effort_reset": thread.get("effort_reset", False),
+                "default_effort": thread.get("default_effort"),
                 "summary": thread.get("summary"),
                 "status": thread.get("status"),
                 "last_event_id": thread.get("last_event_id"),
@@ -284,45 +347,51 @@ class Relay:
             raise RelayError(response.status_code, _detail(response))
         return response.json()
 
-    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        response = await self._http.post(path, json=body)
+    async def _post(self, path: str, body: dict[str, Any], **params: Any) -> dict[str, Any]:
+        response = await self._http.post(path, json=body, params=params or None)
         if response.status_code >= 400:
             raise RelayError(response.status_code, _detail(response))
         return response.json() if response.content else {}
 
-    async def _resume(self, thread_id: str, after: int | None) -> None:
+    async def _resume(self, thread_id: str, after: int | None, chat: str | None = None) -> None:
         """Fill the gap from sqlite, then follow only if there is a turn running.
 
         This uses the replay endpoint rather than the stream precisely so that
         catching up after a bot restart does not spin up a CLI process for
         every thread the bot happened to have open.
         """
-        data = await self._get(f"/v1/threads/{thread_id}/events/replay", after=after or 0)
+        data = await self._get(
+            f"/v1/threads/{thread_id}/events/replay",
+            after=after or 0,
+            **({"chat_id": chat} if chat else {}),
+        )
         for event in data["events"]:
             await self._publish(event["type"], event["payload"])
         if data["status"] != "idle":
-            self._follow(thread_id, data["last_event_id"])
+            self._follow(thread_id, data["last_event_id"], chat)
 
     # -- following -------------------------------------------------------
 
-    def _follow(self, thread_id: str, after: int | None) -> None:
+    def _follow(self, thread_id: str, after: int | None, chat: str | None = None) -> None:
         existing = self._followers.get(thread_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(self._follow_until_idle(thread_id, after))
+        task = asyncio.create_task(self._follow_until_idle(thread_id, after, chat))
         self._followers[thread_id] = task
         task.add_done_callback(lambda t: self._followers.pop(thread_id, None))
 
-    async def _follow_until_idle(self, thread_id: str, after: int | None) -> None:
+    async def _follow_until_idle(
+        self, thread_id: str, after: int | None, chat: str | None = None
+    ) -> None:
         # `_dispatch` publishes `busy` before `POST /messages` returns, so the
         # busy for *this* turn is always in the replayed gap. Requiring it
         # before honouring an idle keeps a stale idle -- one the bot had not
         # yet consumed when it went down -- from ending the follow immediately.
-        seen_busy = await self._is_busy(thread_id)
+        seen_busy = await self._is_busy(thread_id, chat)
         cursor = after
         while True:
             try:
-                async for type_, payload in self._stream(thread_id, cursor):
+                async for type_, payload in self._stream(thread_id, cursor, chat):
                     # Advanced only once the broker has confirmed the publish
                     # (aio_pika confirms by default), never before. Bumping it
                     # first would make the retry below resume *past* the event
@@ -339,6 +408,8 @@ class Relay:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+                    return
                 # The cursor is the whole recovery story: reconnecting with it
                 # replays the gap, so a dropped connection costs latency and
                 # nothing else.
@@ -351,12 +422,14 @@ class Relay:
             log.info("stream for %s ended without idle at %s", thread_id, cursor)
             return
 
-    async def _is_busy(self, thread_id: str) -> bool:
-        response = await self._http.get(f"/v1/threads/{thread_id}")
+    async def _is_busy(self, thread_id: str, chat: str | None = None) -> bool:
+        response = await self._http.get(
+            f"/v1/threads/{thread_id}", params={"chat_id": chat} if chat else None
+        )
         return response.status_code < 400 and response.json().get("status") != "idle"
 
-    async def _stream(self, thread_id: str, after: int | None):
-        params = {"after": after or 0}
+    async def _stream(self, thread_id: str, after: int | None, chat: str | None = None):
+        params = {"after": after or 0, **({"chat_id": chat} if chat else {})}
         async with self._http.stream(
             "GET", f"/v1/threads/{thread_id}/events", params=params, timeout=_TIMEOUT
         ) as response:
@@ -376,6 +449,13 @@ class Relay:
                 # `id:` is ignored on purpose -- the payload carries `id` too,
                 # and one source of truth for the cursor is enough. `:` comment
                 # lines (sse-starlette's keepalive pings) fall through here.
+
+
+def chat_id(command: dict) -> str:
+    value = command.get("chat_id")
+    if type(value) not in (str, int) or not re.fullmatch(r"-?[1-9][0-9]{0,31}", str(value)):
+        raise ValueError("缺少有效聊天归属")
+    return str(value)
 
 
 class RelayError(RuntimeError):

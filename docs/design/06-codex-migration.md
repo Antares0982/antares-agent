@@ -36,8 +36,12 @@ Antares 最多同时执行六个任务；同一会话后续消息排队。SQLite
 
 模式只能在空闲时切换；忙碌时 HTTP 409。Telegram 支持 `/plan`、`/auto`、`/mode plan|auto`。
 需要用户决定时，Agent 用普通中文消息提问并结束本轮。没有审批按钮或 request_user_input 界面。
-profile 在加载会话时确定；quick 使用 low/auto，deep 使用 high/plan，默认采用 runtime 模型。
-需要指定模型时，在新 profiles 目录的 TOML 中设置 `model`。
+profile 仅决定新会话的初始模式，固定为 `auto`、`plan`，不管理模型、effort 或提示词。
+优先级：`/new <profile>` → Alice `DEFAULT_PROFILE` → `workspace.toml` 的
+`workspace.default_profile` → `auto`。后续 `/plan`、`/auto` 不改变模型或 effort。
+不再生成或加载 profile TOML。数据库自动迁移 quick/deep 名称，保留当前模式、模型与上下文；
+自定义旧名称按已存模式归一化。部署配置需将 quick/deep 改为 auto/plan，旧名称不再接受。
+旧 profile 文件保留但不读取；`ANTARES_PROFILES_DIR` 仅保留旧私有文件的沙箱保护路径。
 
 Telegram `/model` 从 Codex 模型目录生成选择按钮，显示当前会话和后续新会话的模型。
 也支持 `/model <模型名>` 和 `/model default`。空闲会话直接切换，下条消息生效，
@@ -46,10 +50,29 @@ Alice 按聊天持久化选择，普通消息、附件和 `/new` 创建会话时
 线程数据库保存模型，首次运行记录 Codex 实际选中的模型，重启和恢复后继续使用它。
 已加载线程的 `thread/resume` 返回旧模型；切换通过下一轮 `turn/start.model` 与
 collaboration mode 的模型设置共同生效，不能依赖 resume 覆盖模型。
-`/model default` 恢复 profile 指定模型或 Codex 默认模型，后续新会话恢复跟随 profile。
+`/model default` 恢复模型目录的默认模型，后续新会话使用默认模型。
 
 对应接口：`GET /v1/models` 返回可选目录，`POST /v1/threads` 接受可选 `model`，
 `POST /v1/threads/{thread_id}/model` 接受 `model`（null 表示默认），线程详情返回 `model`。
+
+Telegram `/effort` 展示当前模型支持的级别及“默认（具体级别）”按钮，授权点击后移除按钮。
+设置同时应用于当前会话及该聊天后续新会话，Alice 持久化后续默认值，服务端保存 thread 覆盖值。
+没有会话时只设置后续默认值；忙碌返回 409，不更改任何设置。旧按钮按当前模型重新校验。
+切换模型时保留兼容覆盖值，不兼容则恢复新模型默认 effort 并告知具体级别。
+新建会话同样校验已保存默认值；`null` 表示默认，每轮从模型目录解析实际级别。
+`GET /v1/models` 增加 `supported_efforts`、`default_effort`；创建请求及 thread 详情增加 `effort`，
+`POST /v1/threads/{thread_id}/effort` 修改覆盖值，`null` 可显式清空。
+
+`/prompt` 查看后续新会话提示词，`/prompt set <文本>` 整体替换，`/prompt clear` 清空。
+支持多行、最多 4000 字符；所有获授权成员均可修改，包括配置了 `"all"` 的群成员。
+聊天提示词保存在服务端独立表中，跨重启和 thread 清理保留；创建 thread 时保存副本，
+作为固定 developer instructions 配置传入；恢复时重用同一份配置，不追加历史消息，
+确保压缩后重启也保留提示词。真实 CLI 检查确认各轮模型请求均只有一份提示词。
+修改和清空仅影响之后 `/new` 的会话，既有会话、排队任务继续使用原副本。
+`GET/POST /v1/chats/{chat_id}/prompt` 读取或替换 `text`，空串表示清空；通过受信任 relay 调用。
+提示词只表达聊天偏好，不改变权限与沙箱。仓库规范继续使用共享 `AGENTS.md`，应用编排和
+文件交付规则继续固定注入。旧 profile 附加文本按用途手动迁入 `AGENTS.md` 或 `/prompt`。
+本次设置迁移不再次清除 Alice thread 绑定，不混用旧版服务端、relay、Alice。
 
 根 `turn/completed` 结束一轮。子 Agent 的派遣与完成通过原生 collab 事件显示，编排提示词
 要求汇总前等待子任务；不模拟 Claude 的后台完成后自动续跑。中断会清空队列；进程崩溃和
@@ -149,3 +172,35 @@ contract 测试用临时 CODEX_HOME 和假令牌，不请求模型，验证真�
 原生技能发现、只读沙箱和自动审查配置。Linux 沙箱嵌套执行需要允许 bubblewrap。
 `ANTARES_LIVE=1 ANTARES_LIVE_AUTH_SOCKET=... pytest tests/test_live.py` 才会运行真实模型测试。
 RPi managed deny-read 的最终检查在真实 unit 命名空间的启动 preflight 中执行。
+
+
+## Telegram 聊天隔离与保留期
+
+`threads.chat_id` 保存 Telegram 会话归属，创建后不变。`POST /v1/threads`
+接收可选字符串 `chat_id`；列表及全部 thread 子接口通过查询参数携带同一归属。
+无参数仅能访问无归属的本地会话；归属不符统一返回 404。relay 的所有聊天命令
+必须提供 `chat_id`，文件上传、重试、事件订阅与回放同样携带。HTTP 与 AMQP
+仍仅对受信任客户端开放，聊天 ID 本身不是认证凭据。
+
+alice 的 `ALLOWED_USER_IDS` 仅授权私聊；`ALLOWED_CHAT_IDS` 改为
+`{群ID: [用户ID, "all"]}`。缺失群、空成员名单均拒绝，私聊不能配置 `"all"`。
+群内文字和图片说明必须 @ bot 或回复 bot；提交前移除对 bot 的提及。
+命令和按钮不要求额外 @，但执行相同鉴权。
+
+升级需停旧 alice、relay 与服务端并协调更新。先修改部署配置中的群名单格式，
+再启动服务端、relay、alice。不要混跑旧协议客户端。
+alice 数据库通过 `user_version=1` 一次性清除旧 thread 绑定，保留模型偏好；
+文件数据库同时使旧未完成任务失效。服务端旧记录不回填 `chat_id`，
+不能从 Telegram 重新绑定；每个聊天下一次使用时创建新会话。
+`relay.thread_bound.owner_chat_id` 由服务端归属确认，旧绑定响应被忽略。
+
+服务启动后及每小时清理不活跃满 30 天的 thread，包含旧无归属会话和软删除记录。
+用户消息、任务完成和设置修改计入活动；查询、回放及空闲实例回收不续期。
+运行、排队和正在传输的会话跳过。先持久标记 `deleted=2` 阻止新操作，
+通过 Codex 0.159.2 `thread/delete` 清除会话及子会话历史，再删除应用事件、
+请求记录和附件缓存，最后删除 thread 行。失败保留删除状态，下次继续。
+工作区代码及用户产物保留，普通 DELETE 接口仍采用原来的软删除。
+alice 收到带 404 状态的命令错误后解除失效绑定，下次消息新建；失败消息不重放。
+
+验证：`ANTARES_CONTRACT=1 .venv/bin/pytest tests/test_codex_contract.py -q`
+使用临时未登录状态，包含真实删除及重复删除，不请求模型。

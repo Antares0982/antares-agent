@@ -80,7 +80,7 @@ class Manifest:
 
 def empty(root: Path) -> Manifest:
     """A workspace with no manifest is legal -- it just has no index to read."""
-    return Manifest(root=root, scratch=".agent", default_profile="quick", repos=(), relations=())
+    return Manifest(root=root, scratch=".agent", default_profile="auto", repos=(), relations=())
 
 
 def load(root: Path, path: Path | None = None) -> Manifest:
@@ -180,7 +180,7 @@ def parse(raw: dict[str, Any], root: Path) -> Manifest:
     return Manifest(
         root=root,
         scratch=scratch,
-        default_profile=str(ws.get("default_profile", "quick")),
+        default_profile=str(ws.get("default_profile", "auto")),
         repos=tuple(repos),
         relations=tuple(relations),
     )

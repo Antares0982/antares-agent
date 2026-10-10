@@ -211,6 +211,19 @@ class Artifacts:
             raise ValueError("附件元数据不符或文件已过期")
         return self.path(row["id"])
 
+    def thread_active(self, thread: str) -> bool:
+        return any(
+            row["id"] in self.active
+            for row in self.db.execute("SELECT id FROM artifacts WHERE thread=?", (thread,))
+        )
+
+    def purge_thread(self, thread: str) -> None:
+        for row in self.db.execute("SELECT id FROM artifacts WHERE thread=?", (thread,)):
+            self.path(row["id"]).unlink(missing_ok=True)
+            self.path(row["id"]).with_suffix(".part").unlink(missing_ok=True)
+        self.db.execute("DELETE FROM artifacts WHERE thread=?", (thread,))
+        self.db.commit()
+
     def cleanup(self) -> None:
         if self.upload_lock.locked():
             return

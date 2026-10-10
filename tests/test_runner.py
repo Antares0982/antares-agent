@@ -24,8 +24,9 @@ class FakeRuntime:
         pass
 
     async def prepare(self, session, profile, mode, instructions):
-        self.prepared_model = profile.model
-        return session or "codex-session", profile.model or "fixture-model"
+        self.prepared_instructions = instructions
+        self.prepared_model = profile
+        return session or "codex-session", profile or "fixture-model"
 
     async def turn(self, session, inputs, mode, profile, model, manifest):
         self.sent.append((inputs, mode))
@@ -64,7 +65,7 @@ async def make(tmp_path):
         "thr_1",
         settings,
         empty(tmp_path),
-        Profile("quick"),
+        Profile("auto"),
         runtime=runtime,
         persist=lambda state: saved.append(state.session_id),
     )
@@ -158,3 +159,35 @@ async def test_outbox_once(tmp_path):
     assert not path.exists()
     assert len([e for e in runner.log.since(0) if e.type == "file"]) == 1
     await runner.close()
+
+
+async def test_initial_prompt(tmp_path):
+    from antares_agent.manager import ThreadManager
+    from antares_agent.store import Store
+
+    settings = Settings(workspace=tmp_path, db_path=tmp_path / "db")
+    store = Store(settings.db_path)
+    manager = ThreadManager(settings, store)
+    manager.runtime = FakeRuntime()
+    store.set_prompt("7", "PROMPT_ALPHA")
+    row = await manager.create(chat_id="7")
+    store.set_prompt("7", "PROMPT_BETA")
+    runner = await manager.runner(row.thread_id)
+    await runner.send("first")
+    await runner.send("queued")
+    await wait_for(lambda: len(manager.runtime.sent) == 1)
+    assert "PROMPT_ALPHA" in manager.runtime.prepared_instructions
+    assert "PROMPT_BETA" not in manager.runtime.prepared_instructions
+    store.set_prompt("7", "")
+    manager.runtime.finish()
+    await wait_for(lambda: len(manager.runtime.sent) == 2)
+    assert manager.runtime.prepared_instructions.count("PROMPT_ALPHA") == 1
+    manager.runtime.finish()
+    await runner._pump
+    await manager.close_thread(row.thread_id)
+    revived = await manager.runner(row.thread_id)
+    assert revived.prompt == "PROMPT_ALPHA"
+    fresh = await manager.create(chat_id="7")
+    assert fresh.prompt == ""
+    await manager.shutdown()
+    store.close()
