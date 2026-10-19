@@ -97,7 +97,7 @@ async def test_first_turn_replay(after) -> None:
         if request.url.path.endswith("/events"):
             replay = request.url.params.get("after") == "0"
             return httpx.Response(200, content=sse(frames if replay else frames[-1:]))
-        return httpx.Response(200, json={"status": "busy"})
+        return httpx.Response(200, json={"status": "busy", "last_event_id": 1})
 
     relay = relay_over(handler)
     await relay._dispatch(
@@ -118,7 +118,7 @@ async def test_follow_stops_at_idle_and_forwards_everything() -> None:
         if request.url.path.endswith("/events"):
             assert request.url.params["after"] == "1"
             return httpx.Response(200, content=sse(frames))
-        return httpx.Response(200, json={"status": "idle"})
+        return httpx.Response(200, json={"status": "idle", "last_event_id": 4})
 
     relay = relay_over(handler)
     await relay._follow_until_idle("thr_x", after=1)
@@ -127,46 +127,65 @@ async def test_follow_stops_at_idle_and_forwards_everything() -> None:
     assert relay.published[1][1]["content"] == "hi"
 
 
-async def test_a_stale_idle_in_the_replayed_gap_does_not_end_the_follow() -> None:
-    """The failure this guards against is silent and total.
-
-    `?after=` replays from the bot's cursor, which can predate the idle that
-    ended the *previous* turn. Treating that as this turn's idle would stop
-    the follow one event in, and everything the turn goes on to produce --
-    including any `approval.required` -- would never reach the bot.
-    """
+@pytest.mark.parametrize("after", [1, 3])
+@pytest.mark.parametrize("mode", ["plan", "auto"])
+@pytest.mark.parametrize("status, last_id", [("busy", 6), ("idle", 8)])
+async def test_mode_idle_replay(after, mode, status, last_id) -> None:
     frames = [
-        event(2, "thread.status", status="idle"),  # the previous turn's
-        event(3, "thread.status", status="busy"),  # this turn's
-        event(4, "text", content="working"),
-        event(5, "thread.status", status="idle"),  # this turn's
-        event(6, "text", content="never reached"),
+        event(2, "thread.status", status="busy"),
+        event(3, "thread.status", status="idle"),
+        event(4, "thread.status", status="idle", permission_mode=mode),
+        event(5, "thread.status", status="busy"),
+        event(6, "text", content="working"),
+        event(7, "turn.done"),
+        event(8, "thread.status", status="idle"),
+        event(9, "text", content="never reached"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(
+                200, content=sse([frame for frame in frames if int(frame[1]["id"][4:]) > after])
+            )
+        return httpx.Response(200, json={"status": status, "last_event_id": last_id})
+
+    relay = relay_over(handler)
+    await relay._follow_until_idle("thr_x", after=after)
+
+    assert relay.published == frames[after - 1 : -1]
+
+
+@pytest.mark.parametrize("status, last_id", [("busy", 8), ("idle", 9)])
+async def test_resume_without_busy(status, last_id) -> None:
+    frames = [event(9, "thread.status", status="idle")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, content=sse(frames))
+        return httpx.Response(200, json={"status": status, "last_event_id": last_id})
+
+    relay = relay_over(handler)
+    await relay._follow_until_idle("thr_x", after=8)
+
+    assert relay.published == frames
+
+
+async def test_idle_snapshot_tail() -> None:
+    frames = [
+        event(9, "thread.status", status="idle"),
+        event(10, "error", code="interrupted"),
+        event(11, "text", content="never reached"),
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/events"):
             return httpx.Response(200, content=sse(frames))
-        return httpx.Response(200, json={"status": "idle"})
-
-    relay = relay_over(handler)
-    await relay._follow_until_idle("thr_x", after=1)
-
-    assert [p.get("content") for _, p in relay.published] == [None, None, "working", None]
-
-
-async def test_a_thread_already_busy_needs_no_fresh_busy_event() -> None:
-    # After a relay restart there is no new `busy` to see: the turn started
-    # before this process did. Without the status probe the follower would
-    # never stop, and the thread would be followed (and so kept live) forever.
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/events"):
-            return httpx.Response(200, content=sse([event(9, "thread.status", status="idle")]))
-        return httpx.Response(200, json={"status": "busy"})
+        return httpx.Response(200, json={"status": "idle", "last_event_id": 10})
 
     relay = relay_over(handler)
     await relay._follow_until_idle("thr_x", after=8)
 
-    assert len(relay.published) == 1
+    assert relay.published == frames[:2]
 
 
 async def test_a_failed_publish_is_retried_from_the_event_that_failed() -> None:
@@ -191,7 +210,7 @@ async def test_a_failed_publish_is_retried_from_the_event_that_failed() -> None:
                     ]
                 ),
             )
-        return httpx.Response(200, json={"status": "idle"})
+        return httpx.Response(200, json={"status": "idle", "last_event_id": 4})
 
     relay = relay_over(handler)
     failed: list[str] = []
@@ -216,7 +235,7 @@ async def test_one_follower_per_thread() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/events"):
             return httpx.Response(200, content=sse([event(2, "thread.status", status="idle")]))
-        return httpx.Response(200, json={"status": "busy"})
+        return httpx.Response(200, json={"status": "busy", "last_event_id": 1})
 
     relay = relay_over(handler)
     relay._follow("thr_x", 1)
@@ -266,7 +285,7 @@ async def test_message_posts_then_follows() -> None:
             return httpx.Response(202, json={"status": "accepted", "position": None})
         if request.url.path.endswith("/events"):
             return httpx.Response(200, content=sse([event(3, "thread.status", status="idle")]))
-        return httpx.Response(200, json={"status": "busy"})
+        return httpx.Response(200, json={"status": "busy", "last_event_id": 2})
 
     relay = relay_over(handler)
     await relay._dispatch(
