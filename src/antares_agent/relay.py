@@ -383,11 +383,11 @@ class Relay:
     async def _follow_until_idle(
         self, thread_id: str, after: int | None, chat: str | None = None
     ) -> None:
-        # `_dispatch` publishes `busy` before `POST /messages` returns, so the
-        # busy for *this* turn is always in the replayed gap. Requiring it
-        # before honouring an idle keeps a stale idle -- one the bot had not
-        # yet consumed when it went down -- from ending the follow immediately.
-        seen_busy = await self._is_busy(thread_id, chat)
+        snapshot = await self._get(
+            f"/v1/threads/{thread_id}", **({"chat_id": chat} if chat else {})
+        )
+        # Historical idle events cannot end live following.
+        boundary = snapshot["last_event_id"]
         cursor = after
         while True:
             try:
@@ -399,12 +399,11 @@ class Relay:
                     # confirm exists precisely so that cannot happen.
                     await self._publish(type_, payload)
                     cursor = _event_id(payload) or cursor
-                    if type_ != "thread.status":
-                        continue
-                    if payload.get("status") == "idle" and seen_busy:
+                    if (cursor or 0) >= boundary and (
+                        snapshot["status"] == "idle"
+                        or (type_ == "thread.status" and payload.get("status") == "idle")
+                    ):
                         return
-                    if payload.get("status") != "idle":
-                        seen_busy = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -421,12 +420,6 @@ class Relay:
             # stop and let the next command decide.
             log.info("stream for %s ended without idle at %s", thread_id, cursor)
             return
-
-    async def _is_busy(self, thread_id: str, chat: str | None = None) -> bool:
-        response = await self._http.get(
-            f"/v1/threads/{thread_id}", params={"chat_id": chat} if chat else None
-        )
-        return response.status_code < 400 and response.json().get("status") != "idle"
 
     async def _stream(self, thread_id: str, after: int | None, chat: str | None = None):
         params = {"after": after or 0, **({"chat_id": chat} if chat else {})}
