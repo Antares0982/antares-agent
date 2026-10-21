@@ -21,8 +21,9 @@ that permits local sockets. Do not skip failures caused by the execution sandbox
 ## Runtime
 
 Request flow: api → manager → runner → shared runtime → translator → eventlog → store.
-Each service uses one Codex app-server. Six turns may execute concurrently; each thread queues
-its messages. Codex owns conversation files; SQLite owns thread IDs, modes, events and transfers.
+Each service uses one Codex app-server. Six turns may execute concurrently; follow-ups steer the
+active turn and queue only between turns. Codex owns conversation files; SQLite owns thread IDs,
+modes, events and transfers.
 
 - Use `on-request` with `auto_review`; never replace automatic review with `never` or blanket approval.
 - Unexpected command/file approval callbacks decline. User questions use ordinary assistant text.

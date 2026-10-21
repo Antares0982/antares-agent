@@ -25,7 +25,10 @@ Antares 的 systemd `MemoryDenyWriteExecute` 关闭：真实模型工具调用�
 ## 运行时
 
 Python SDK 与 CLI 均锁定 `openai-codex==0.159.2`。每个服务运行一个 app-server，
-Antares 最多同时执行六个任务；同一会话后续消息排队。SQLite 保留 Codex thread ID、
+Antares 最多同时执行六个任务；同一会话后续消息通过 `turn/steer` 注入当前 turn。
+等待执行名额、启动和收尾期间暂存消息，turn 就绪后立即按序 steering；若服务端明确
+返回 `no active turn to steer`，保留消息到下一轮，交接结果不确定时不自动重放。
+SQLite 保留 Codex thread ID、
 模式、摘要和 SSE 历史；完整模型上下文仍由 Codex 保管。每轮完成释放订阅，后续恢复 thread。
 
 `plan` 对应原生 plan collaboration mode 和只读沙箱；`auto` 对应 default collaboration mode
