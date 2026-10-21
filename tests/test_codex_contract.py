@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 from openai_codex.client import CodexClient
+from openai_codex.errors import InvalidRequestError
 from openai_codex.generated.v2_all import (
     CommandExecResponse,
     SkillsExtraRootsSetResponse,
@@ -75,9 +76,13 @@ def test_runtime_contract(tmp_path):
             },
         }
         started = client.thread_start(options)
+        with pytest.raises(InvalidRequestError, match="no active turn to steer"):
+            client.turn_steer(started.thread.id, "finished-turn", "follow-up")
         turn = client.turn_start(started.thread.id, [{"type": "text", "text": "fixture"}])
         while client.next_turn_notification(turn.turn.id).method != "turn/completed":
             pass
+        with pytest.raises(InvalidRequestError, match="no active turn to steer"):
+            client.turn_steer(started.thread.id, turn.turn.id, "follow-up")
         resumed = client.thread_resume(started.thread.id, {**options, "model": models[1].model})
         assert resumed.thread.id == started.thread.id
         turn = client.turn_start(

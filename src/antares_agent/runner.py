@@ -8,6 +8,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from openai_codex.errors import InvalidRequestError
+
 from . import gitdiff, index
 from .artifacts import Artifacts, signature
 from .config import Settings
@@ -69,6 +71,7 @@ class ThreadRunner:
         self._turn_id: str | None = None
         self._stopping = False
         self._waiting = True
+        self._input_lock = asyncio.Lock()
 
     @property
     def thread_id(self):
@@ -94,7 +97,13 @@ class ThreadRunner:
         skills.mkdir(parents=True, exist_ok=True)
 
     async def send(self, text):
+        async with self._input_lock:
+            return await self._send(text)
+
+    async def _send(self, text):
         if self.busy:
+            if self._turn_id and not self._stopping and await self._steer(text):
+                return None
             self.state.queue.append(text)
             position = len(self.state.queue)
             self.log.publish(Event(EventType.QUEUED, self.thread_id, {"position": position}))
@@ -104,6 +113,21 @@ class ThreadRunner:
         self._set_status(ThreadStatus.BUSY)
         self._pump = asyncio.create_task(self._run(text))
         return None
+
+    async def _steer(self, inputs):
+        try:
+            await asyncio.to_thread(
+                self.runtime.client.turn_steer,
+                self.state.session_id,
+                self._turn_id,
+                inputs,
+            )
+        except InvalidRequestError as exc:
+            if exc.message != "no active turn to steer":
+                raise
+            self._turn_id = None
+            return False
+        return True
 
     async def set_model(self, model: str, effort: str | None = None):
         if self.busy:
@@ -163,7 +187,8 @@ class ThreadRunner:
                         model,
                         self.manifest,
                     )
-                    self._turn_id = started.turn.id
+                    turn_id = started.turn.id
+                    self._turn_id = turn_id
                     if self._stopping:
                         await asyncio.to_thread(
                             self.runtime.client.turn_interrupt, session, self._turn_id
@@ -171,11 +196,19 @@ class ThreadRunner:
                     client = self.runtime.client
                     assert client is not None
                     try:
+                        async with self._input_lock:
+                            while self.state.queue and self._turn_id and not self._stopping:
+                                pending = self.state.queue.popleft()
+                                if not await self._steer(pending):
+                                    self.state.queue.appendleft(pending)
+                                    break
                         while True:
                             notification = await asyncio.to_thread(
-                                client.next_turn_notification, self._turn_id
+                                client.next_turn_notification, turn_id
                             )
                             if notification.method == "turn/completed":
+                                async with self._input_lock:
+                                    self._turn_id = None
                                 self.translator.usage = getattr(self.runtime, "usage", {}).get(
                                     session, self.translator.usage
                                 )
@@ -184,8 +217,7 @@ class ThreadRunner:
                             if notification.method == "turn/completed":
                                 break
                     finally:
-                        client.unregister_turn_notifications(self._turn_id)
-                    self._turn_id = None
+                        client.unregister_turn_notifications(turn_id)
                     await self._publish_diffs()
                     await self._publish_outbox()
                     await self.runtime.release(session)
