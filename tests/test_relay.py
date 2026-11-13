@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -78,6 +79,43 @@ async def test_waiting_for_the_agent_gives_up_eventually(
 
 async def _no_wait(_seconds: float) -> None:
     return None
+
+
+@pytest.mark.parametrize(
+    ("op", "extra", "background"),
+    [
+        ("resume", {"background": True}, True),
+        ("resume", {}, False),
+        ("resume", {"background": False}, False),
+        ("resume", {"background": 1}, False),
+        ("resume", {"background": "true"}, False),
+        ("switch", {"background": True}, False),
+        ("message", {"background": True}, False),
+    ],
+)
+async def test_failure_context(op, extra, background) -> None:
+    relay = relay_over(lambda r: httpx.Response(404, json={"detail": "会话不存在或无权访问"}))
+    cmd = {"op": op, "thread_id": "expired", "chat_id": "7", **extra}
+    message = MagicMock()
+    message.body = json.dumps(cmd).encode()
+    try:
+        await relay._on_command(message)
+        assert relay.published == [
+            (
+                relay_mod.CMD_FAILED,
+                {
+                    "op": op,
+                    "thread_id": "expired",
+                    "chat_id": "7",
+                    "status": 404,
+                    "detail": "HTTP 404: 会话不存在或无权访问",
+                    **({"background": True} if background else {}),
+                },
+            )
+        ]
+        message.process.assert_called_once_with(requeue=True)
+    finally:
+        await relay._http.aclose()
 
 
 # --- following -----------------------------------------------------------

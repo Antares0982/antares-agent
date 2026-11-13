@@ -205,5 +205,11 @@ alice 数据库通过 `user_version=1` 一次性清除旧 thread 绑定，保留
 工作区代码及用户产物保留，普通 DELETE 接口仍采用原来的软删除。
 alice 收到带 404 状态的命令错误后解除失效绑定，下次消息新建；失败消息不重放。
 
+启动及 `relay.online` 触发的后台恢复在 AMQP `resume` 命令中携带
+`background: true`。relay 仅为此类命令在 `relay.cmd_failed` 中回传该标记。
+alice 对带标记的 404 静默解除绑定，重复错误也不发送 Telegram 消息；
+主动切换会话的恢复不带标记，其错误及后台非 404 错误保持提示。
+先更新 relay，再更新 alice；旧 relay 不回传标记时仍按原逻辑提示错误。
+
 验证：`ANTARES_CONTRACT=1 .venv/bin/pytest tests/test_codex_contract.py -q`
 使用临时未登录状态，包含真实删除及重复删除，不请求模型。
