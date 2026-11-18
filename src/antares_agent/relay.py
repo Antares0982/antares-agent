@@ -190,6 +190,11 @@ class Relay:
                         "thread_id": cmd.get("thread_id"),
                         "detail": str(exc),
                         "status": getattr(exc, "status", None),
+                        **(
+                            {"background": True}
+                            if cmd.get("op") == "resume" and cmd.get("background") is True
+                            else {}
+                        ),
                     },
                 )
 
