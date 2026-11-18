@@ -6,7 +6,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "openai-codex==0.159.2",
+    "openai-codex==0.170.0",
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "sse-starlette>=2.1",
